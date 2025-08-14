@@ -32,7 +32,7 @@
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
 
-<!-- TensorFlow.js + Face Landmarks Detection (with iris) -->
+<!-- TensorFlow.js + Face Landmarks Detection (FaceMesh) -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.14.0/dist/tf-core.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.14.0/dist/tf-converter.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.14.0/dist/tf-backend-webgl.min.js"></script>
@@ -52,7 +52,6 @@
       <div class="bar">
         <select id="camera"></select>
         <select id="microphone"></select>
-        <label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="mirror"> Mirror</label>
         <span class="tag" id="perm">Permissions: not requested</span>
       </div>
       <div class="bar">
@@ -102,7 +101,6 @@
   const cx = cv.getContext('2d');
   const camSel = document.getElementById('camera');
   const micSel = document.getElementById('microphone');
-  const mirror = document.getElementById('mirror');
   const perm = document.getElementById('perm');
   const enableBtn = document.getElementById('enable');
   const startBtn = document.getElementById('start');
@@ -124,8 +122,6 @@
   let stream=null, mediaRecorder=null, chunks=[];
   let recording=false, paused=false;
   let tIv=null, tStart=0;
-
-  // FaceMesh model
   let flModel=null;
 
   // ---------- Utils ----------
@@ -196,116 +192,95 @@
     };
   }
 
-  // ---------- Overlay guide ----------
+  // ---------- Overlay guide (center box only; no mirroring) ----------
   function drawGuide(){
     requestAnimationFrame(drawGuide);
     if(!v || v.readyState < 2) return;
     setCanvasSize();
     const W=cv.width, H=cv.height;
     cx.clearRect(0,0,W,H);
-    cx.save();
-    if(mirror.checked){ cx.translate(W,0); cx.scale(-1,1); }
     cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
-    const gx=W*0.28, gy=H*0.25, gw=W*0.44, gh=H*0.5; // acceptable center window
+    const gx=W*0.20, gy=H*0.20, gw=W*0.60, gh=H*0.60; // wider acceptance window
     cx.strokeRect(gx,gy,gw,gh);
-    cx.restore();
   }
-  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
 
-  // ---------- FaceMesh load (once, lazy) ----------
+  // ---------- FaceMesh load (once) ----------
   async function ensureFaceModel(){
     if(flModel) return;
     await tf.setBackend('webgl');
     flModel = await faceLandmarksDetection.load(
       faceLandmarksDetection.SupportedPackages.mediapipeFacemesh,
-      { maxFaces: 1, shouldLoadIrisModel: true }
+      { maxFaces: 1, shouldLoadIrisModel: false }
     );
   }
 
-  // ---------- Helpers for gaze & pose ----------
+  // ---------- Facing-forward heuristic (no eye-gaze) ----------
   function bboxFromPoints(points){
+    if(!points || !points.length) return null;
     let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
     for(const p of points){ const x=p[0], y=p[1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
-    return {x:minX,y:minY,w:maxX-minX,h:maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
+    return {x:minX,y:minY,w:maxX-minX,h=maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
   }
-  function avgPoint(arr){ let x=0,y=0,n=arr.length||1; for(const p of arr){ x+=p[0]; y+=p[1]; } return [x/n,y/n]; }
+  function avgPoint(arr){ if(!arr?.length) return null; let x=0,y=0; for(const p of arr){ x+=p[0]; y+=p[1]; } return [x/arr.length,y/arr.length]; }
 
-  // Eye contact rule: centered+big + head yaw/pitch modest + both irises near eye centers
-  function eyeContactFromAnnotations(ann, frameW, frameH){
-    if(!ann?.leftEyeIris || !ann?.rightEyeIris) return false;
-
-    const leftIrisC = avgPoint(ann.leftEyeIris);
-    const rightIrisC = avgPoint(ann.rightEyeIris);
-
-    const leftEyePts = []
-      .concat(ann.leftEyeUpper0||[], ann.leftEyeLower0||[], ann.leftEyeInnerCorner||[], ann.leftEyeOuterCorner||[]);
-    const rightEyePts = []
-      .concat(ann.rightEyeUpper0||[], ann.rightEyeLower0||[], ann.rightEyeInnerCorner||[], ann.rightEyeOuterCorner||[]);
-
-    const lb = bboxFromPoints(leftEyePts), rb = bboxFromPoints(rightEyePts);
-    const lCenter = [lb.cx, lb.cy], rCenter = [rb.cx, rb.cy];
-
-    // Normalized iris offset per eye (0 = center, 1 = at eyelid edge)
-    const ldx = Math.abs(leftIrisC[0]-lCenter[0]) / (lb.w/2 || 1);
-    const ldy = Math.abs(leftIrisC[1]-lCenter[1]) / (lb.h/2 || 1);
-    const rdx = Math.abs(rightIrisC[0]-rCenter[0]) / (rb.w/2 || 1);
-    const rdy = Math.abs(rightIrisC[1]-rCenter[1]) / (rb.h/2 || 1);
-
-    const irisCentered = (ldx<0.35 && ldy<0.35 && rdx<0.35 && rdy<0.35); // stricter gaze threshold
-
-    // Head pose & framing (use coarse bbox of full mesh)
+  function forwardFacing(ann, frameW, frameH){
+    // Build a coarse face bbox
     const facePts = []
       .concat(ann.silhouette||[], ann.leftCheek||[], ann.rightCheek||[], ann.midwayBetweenEyes||[], ann.noseTip||[]);
-    if(facePts.length===0) return false;
     const fb = bboxFromPoints(facePts);
+    if(!fb) return false;
 
-    const centerOk = (fb.cx > frameW*0.28 && fb.cx < frameW*0.72 && fb.cy > frameH*0.25 && fb.cy < frameH*0.75);
-    const sizeOk   = (fb.w*fb.h)/(frameW*frameH) > 0.035;
+    // Framing: generous center & size (aiming for 100% when you’re straight on)
+    const centerOk = (fb.cx > frameW*0.20 && fb.cx < frameW*0.80 && fb.cy > frameH*0.18 && fb.cy < frameH*0.82);
+    const sizeOk   = (fb.w*fb.h)/(frameW*frameH) > 0.020; // ≥2% of frame
 
-    // Yaw/pitch heuristics from eye lines & nose relative to eye-line
-    const Lc = avgPoint(ann.leftEyeUpper0||[]);
-    const Rc = avgPoint(ann.rightEyeUpper0||[]);
+    // Eyes level (roll/pitch proxy)
+    const LU = ann.leftEyeUpper0||[], RU = ann.rightEyeUpper0||[], LL = ann.leftEyeLower0||[], RL = ann.rightEyeLower0||[];
+    if(!LU.length || !RU.length) return false;
+    const Lc = avgPoint(LU.concat(LL)), Rc = avgPoint(RU.concat(RL));
+    if(!Lc || !Rc) return false;
     const eyeDx = Math.hypot((Rc[0]-Lc[0]), (Rc[1]-Lc[1])) || 1;
-    const eyesLevel = Math.abs((Rc[1]-Lc[1]))/eyeDx < 0.18; // pitch/roll proxy
+    const eyesLevel = Math.abs((Rc[1]-Lc[1]))/eyeDx < 0.20; // lenient
 
-    const nose = (ann.noseTip && ann.noseTip[0]) ? ann.noseTip[0] : avgPoint(ann.noseBottom||ann.noseBridge||[[fb.cx,fb.cy]]);
-    const earL = (ann.leftEarTragion && ann.leftEarTragion[0]) ? ann.leftEarTragion[0] : [fb.x, fb.cy];
-    const earR = (ann.rightEarTragion && ann.rightEarTragion[0]) ? ann.rightEarTragion[0] : [fb.x+fb.w, fb.cy];
-    const dNL = Math.hypot(nose[0]-earL[0], nose[1]-earL[1]);
-    const dNR = Math.hypot(nose[0]-earR[0], nose[1]-earR[1]);
+    // Yaw: nose roughly centered between “ears” (fallback to silhouette extremes)
+    let leftRef = ann.leftEarTragion?.[0];
+    let rightRef = ann.rightEarTragion?.[0];
+    if(!leftRef || !rightRef){
+      if(ann.silhouette?.length){
+        leftRef  = ann.silhouette.reduce((a,b)=> b[0]<a[0]?b:a);
+        rightRef = ann.silhouette.reduce((a,b)=> b[0]>a[0]?b:a);
+      }else{
+        leftRef=[fb.x, fb.cy]; rightRef=[fb.x+fb.w, fb.cy];
+      }
+    }
+    const nose = ann.noseTip?.[0] || avgPoint(ann.noseBottom||ann.noseBridge||[[fb.cx,fb.cy]]);
+    const dNL = Math.hypot(nose[0]-leftRef[0],  nose[1]-leftRef[1]);
+    const dNR = Math.hypot(nose[0]-rightRef[0], nose[1]-rightRef[1]);
     const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
-    const yawOk = yawSkew < 0.30;
+    const yawOk = yawSkew < 0.35; // lenient for real-world
 
-    return centerOk && sizeOk && eyesLevel && yawOk && irisCentered;
+    // Pitch: nose near eye-line vertically relative to face height
+    const eyeMidY = (Lc[1]+Rc[1])/2;
+    const pitch = Math.abs(nose[1]-eyeMidY) / (fb.h || 1);
+    const pitchOk = pitch < 0.38; // lenient
+
+    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
   }
 
   // ---------- Analyzer (post-recording) ----------
-  // Fix Chrome "Infinity" duration by nudging time
   async function loadVideoForAnalysis(src){
     return new Promise((resolve, reject)=>{
       const av = document.createElement('video');
-      av.preload = 'auto';
-      av.muted = true;
-      av.playsInline = true;
-      av.src = src;
+      av.preload = 'auto'; av.muted = true; av.playsInline = true; av.src = src;
 
       function finish(){
-        if (!isFinite(av.duration) || av.duration <= 0) {
-          reject(new Error('Could not read video duration.'));
-        } else {
-          resolve(av);
-        }
+        if (!isFinite(av.duration) || av.duration <= 0) reject(new Error('Could not read video duration.'));
+        else resolve(av);
       }
-
       av.addEventListener('loadedmetadata', ()=>{
-        if (isFinite(av.duration) && av.duration > 0 && av.duration !== Infinity) {
-          finish();
-        } else {
-          const onTimeUpdate = ()=>{
-            av.removeEventListener('timeupdate', onTimeUpdate);
-            av.currentTime = 0;
-            setTimeout(finish, 0);
-          };
+        if (isFinite(av.duration) && av.duration > 0 && av.duration !== Infinity) finish();
+        else {
+          const onTimeUpdate = ()=>{ av.removeEventListener('timeupdate', onTimeUpdate); av.currentTime = 0; setTimeout(finish, 0); };
           av.addEventListener('timeupdate', onTimeUpdate);
           try { av.currentTime = 1e101; } catch(_){}
           try { av.play().then(()=>{ av.pause(); }).catch(()=>{}); } catch(_){}
@@ -316,17 +291,16 @@
   }
 
   async function analyzeEyeContact(videoURL){
-    if(!videoURL){ throw new Error('No video to analyze.'); }
+    if(!videoURL) throw new Error('No video to analyze.');
     await ensureFaceModel();
 
     const av = await loadVideoForAnalysis(videoURL);
-    const W = av.videoWidth || 1280;
-    const H = av.videoHeight || 720;
+    const W = av.videoWidth || 1280, H = av.videoHeight || 720;
     const off = document.createElement('canvas'); off.width=W; off.height=H;
     const ox = off.getContext('2d');
 
     const duration = av.duration;
-    const targetFPS = 6;                // denser sampling than before
+    const targetFPS = 6; // denser sampling
     const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
     let total=0, facing=0;
 
@@ -340,12 +314,13 @@
 
       ox.drawImage(av, 0, 0, W, H);
 
-      // Estimate landmarks with iris
-      const preds = await flModel.estimateFaces({input: off, flipHorizontal: false, returnTensors: false, predictIrises: true});
+      const preds = await flModel.estimateFaces({
+        input: off, flipHorizontal: false, returnTensors: false, predictIrises: false
+      });
       total++;
 
       if (Array.isArray(preds) && preds.length === 1 && preds[0].annotations) {
-        if (eyeContactFromAnnotations(preds[0].annotations, W, H)) facing++;
+        if (forwardFacing(preds[0].annotations, W, H)) facing++;
       }
 
       const pct = Math.round((i+1)/totalSteps*100);
@@ -363,7 +338,7 @@
   enableBtn.addEventListener('click', async ()=>{
     clearErr();
     try{
-      const got = await requestPermissionsRobust();  // prompts on click
+      const got = await requestPermissionsRobust();
       await listDevices();
       await startStream(!!got.audio);
       perm.textContent='Permissions: granted';
@@ -373,17 +348,11 @@
       console.error(e);
       perm.textContent='Permissions: denied';
       let msg = 'Unable to access camera/microphone.\n\n';
-      if(e && e.name==='NotAllowedError'){
-        msg += 'Access was blocked.\nChrome: lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.';
-      } else if(e && e.name==='NotFoundError'){
-        msg += 'No camera/microphone found. Connect a device and try again.';
-      } else if(e && e.name==='NotReadableError'){
-        msg += 'Your camera/mic is in use by another app. Close it and retry.';
-      } else if(e && e.name==='OverconstrainedError'){
-        msg += 'Selected device not available. Choose another camera/mic.';
-      } else {
-        msg += (e && e.message) ? e.message : String(e);
-      }
+      if(e && e.name==='NotAllowedError'){ msg += 'Access was blocked.\nChrome: lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.'; }
+      else if(e && e.name==='NotFoundError'){ msg += 'No camera/microphone found. Connect a device and try again.'; }
+      else if(e && e.name==='NotReadableError'){ msg += 'Your camera/mic is in use by another app. Close it and retry.'; }
+      else if(e && e.name==='OverconstrainedError'){ msg += 'Selected device not available. Choose another camera/mic.'; }
+      else { msg += (e && e.message) ? e.message : String(e); }
       showErr(msg);
       hint.style.display='block';
       hint.textContent='Windows tip: Settings → Privacy & security → Camera/Microphone → allow access for browsers.';
@@ -400,7 +369,6 @@
     mediaRecorder.start();
     recording=true; paused=false;
     startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
-    // simple timer
     const t0 = Date.now(); timerEl.textContent='00:00';
     tIv = setInterval(()=>{ const s=(Date.now()-t0)/1000; const m=Math.floor(s/60).toString().padStart(2,'0'); const ss=Math.floor(s%60).toString().padStart(2,'0'); timerEl.textContent=`${m}:${ss}`; }, 250);
   });
