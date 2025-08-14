@@ -28,273 +28,32 @@
   .water{position:absolute;right:10px;bottom:10px;font-size:11px;padding:6px 8px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
   .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none;white-space:pre-line}
   .hint{font-size:12px;color:var(--muted)}
+  .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
+  .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
-<!-- MediaPipe Tasks Vision (Face Landmarker + blendshapes) -->
-<script type="module">
-import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13";
-
-const els = {
-  v: document.getElementById('preview'),
-  pb: document.getElementById('playback'),
-  cv: document.getElementById('overlay'),
-  camSel: document.getElementById('camera'),
-  micSel: document.getElementById('microphone'),
-  mirror: document.getElementById('mirror'),
-  perm: document.getElementById('perm'),
-  enableBtn: document.getElementById('enable'),
-  startBtn: document.getElementById('start'),
-  pauseBtn: document.getElementById('pause'),
-  resumeBtn: document.getElementById('resume'),
-  stopBtn: document.getElementById('stop'),
-  downloadLink: document.getElementById('download'),
-  timerEl: document.getElementById('timer'),
-  errBox: document.getElementById('err'),
-  hint: document.getElementById('hint'),
-  liveDot: document.getElementById('liveDot'),
-  scoreEl: document.getElementById('score'),
-  scoreDetail: document.getElementById('scoreDetail'),
-};
-const cx = els.cv.getContext('2d');
-
-let stream=null, mediaRecorder=null, chunks=[];
-let faceLandmarker=null, running=false;
-let recording=false, paused=false;
-let samples=0, facingSamples=0, sampleFPS=10, lastSampleTs=0;
-
-function showErr(msg){ els.errBox.textContent = msg; els.errBox.style.display = 'block'; }
-function clearErr(){ els.errBox.style.display='none'; els.errBox.textContent=''; }
-
-function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
-let tIv=null, tStart=0;
-function startTimer(){ tStart=Date.now(); els.timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ els.timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
-function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
-
-function setCanvasSize(){
-  const w=els.v.videoWidth||els.cv.clientWidth, h=els.v.videoHeight||els.cv.clientHeight;
-  if(w&&h){ els.cv.width=w; els.cv.height=h; }
-}
-
-async function listDevices(){
-  const devs = await navigator.mediaDevices.enumerateDevices();
-  const cams = devs.filter(d=>d.kind==='videoinput');
-  const mics = devs.filter(d=>d.kind==='audioinput');
-  els.camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
-  els.micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
-}
-
-async function preflightPermissions(){
-  els.perm.textContent='Permissions: requesting…';
-  const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
-  pre.getTracks().forEach(t=>t.stop());
-}
-
-async function startStream(){
-  if(stream) stream.getTracks().forEach(t=>t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { deviceId: els.camSel.value? {exact:els.camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
-    audio: { deviceId: els.micSel.value? {exact:els.micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-  });
-  els.v.srcObject = stream; els.v.muted = true; await els.v.play();
-  els.liveDot.classList.add('live');
-  setCanvasSize();
-}
-
-function setupRecorder(){
-  chunks.length=0;
-  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-               MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
-  mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
-  mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
-  mediaRecorder.onstop = ()=>{
-    const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
-    const url = URL.createObjectURL(blob);
-    els.pb.src = url; els.downloadLink.href = url; els.downloadLink.style.display='inline-flex';
-    els.downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
-
-    const pct = samples? Math.round((facingSamples/samples)*100): 0;
-    els.scoreEl.textContent = pct + '%';
-    els.scoreEl.style.color = pct>=70? 'var(--ok)' : pct>=40? 'var(--warn)' : 'var(--bad)';
-    els.scoreDetail.textContent = `${facingSamples} of ${samples} sampled frames (~${sampleFPS} fps)`;
-  };
-}
-
-// ---------- Face Landmarker setup + Eye Contact logic ----------
-function getBlend(cats, name){ const c = cats.find(x=>x.categoryName===name); return c? c.score : 0; }
-
-// Decide if “facing camera” using: centered + large enough + eyes looking forward (blendshapes small)
-function isFacing(landmarks, cats, W, H){
-  // bbox from landmarks (normalized [0..1])
-  let minX=1, minY=1, maxX=0, maxY=0;
-  for(const p of landmarks){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; }
-  const w=(maxX-minX)*W, h=(maxY-minY)*H;
-  const cx=(minX+maxX)/2*W, cy=(minY+maxY)/2*H;
-
-  const centerOk = (cx > W*0.28 && cx < W*0.72 && cy > H*0.25 && cy < H*0.75);
-  const sizeOk   = (w*h)/(W*H) > 0.035; // ~3.5% of frame
-
-  // Eye-gaze “forwardness”: sum of eyeLook* blendshapes should be small when looking forward
-  const lookSum =
-    getBlend(cats,'eyeLookInLeft') + getBlend(cats,'eyeLookOutLeft') +
-    getBlend(cats,'eyeLookUpLeft') + getBlend(cats,'eyeLookDownLeft') +
-    getBlend(cats,'eyeLookInRight') + getBlend(cats,'eyeLookOutRight') +
-    getBlend(cats,'eyeLookUpRight') + getBlend(cats,'eyeLookDownRight');
-
-  const gazeOk = lookSum < 0.9; // threshold tuned for TF/MediaPipe scales (0..1)
-
-  return centerOk && sizeOk && gazeOk;
-}
-
-function drawOverlay(landmarks, W, H, mirror){
-  cx.clearRect(0,0,W,H);
-  cx.save();
-  if(mirror){ cx.translate(W,0); cx.scale(-1,1); }
-
-  // bbox
-  let minX=1, minY=1, maxX=0, maxY=0;
-  for(const p of landmarks){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; }
-  cx.lineWidth=2; cx.strokeStyle='rgba(122,162,255,0.95)';
-  cx.strokeRect(minX*W, minY*H, (maxX-minX)*W, (maxY-minY)*H);
-
-  // a few landmark dots (every ~20th to avoid too many)
-  cx.fillStyle='rgba(122,162,255,0.95)';
-  for(let i=0;i<landmarks.length;i+=20){
-    const p=landmarks[i]; cx.beginPath(); cx.arc(p.x*W, p.y*H, 2.5, 0, Math.PI*2); cx.fill();
-  }
-
-  cx.restore();
-}
-
-async function initFaceLandmarker(){
-  if(faceLandmarker) return;
-  const fileset = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13/wasm"
-  );
-  faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
-    baseOptions: {
-      modelAssetPath: "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13/wasm/face_landmarker.task"
-    },
-    runningMode: "VIDEO",
-    numFaces: 1,
-    outputFaceBlendshapes: true,
-    outputFacialTransformationMatrixes: false
-  });
-}
-
-function detectLoop(){
-  if(!running) return;
-  requestAnimationFrame(detectLoop);
-  if(!els.v || els.v.readyState < 2) return;
-
-  setCanvasSize();
-  const W = els.cv.width, H = els.cv.height;
-  const ts = performance.now();
-  const res = faceLandmarker.detectForVideo(els.v, ts);
-  const faces = res.faceLandmarks || [];
-  const shapes = res.faceBlendshapes || [];
-
-  if(faces.length){
-    drawOverlay(faces[0], W, H, els.mirror.checked);
-
-    // Sample toward Eye Contact % while recording
-    const now = performance.now();
-    if(recording && !paused && (now - lastSampleTs) > (1000/sampleFPS)){
-      lastSampleTs = now;
-      samples++;
-      const cats = (shapes[0] && shapes[0].categories) ? shapes[0].categories : [];
-      if(isFacing(faces[0], cats, W, H)) facingSamples++;
-    }
-  }else{
-    cx.clearRect(0,0,W,H);
-  }
-}
-// ---------------------------------------------------------------
-
-// UI handlers
-els.mirror.addEventListener('change', ()=>{ els.v.style.transform = els.mirror.checked? 'scaleX(-1)':'none'; });
-
-els.enableBtn.addEventListener('click', async ()=>{
-  clearErr();
-  try{
-    await preflightPermissions();   // user-gesture prompt
-    await listDevices();            // device labels
-    await startStream();            // real stream
-    await initFaceLandmarker();     // load model (once)
-    els.perm.textContent='Permissions: granted';
-    els.enableBtn.disabled=true;
-    els.startBtn.disabled=false;
-    running = true; detectLoop();
-  }catch(e){
-    console.error(e);
-    els.perm.textContent='Permissions: denied';
-    let msg = 'Unable to access camera/microphone.\n\n';
-    if(e && e.name==='NotAllowedError'){
-      msg += 'Access was blocked. Chrome: click the lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.';
-    } else if(e && e.name==='NotFoundError'){
-      msg += 'No camera/microphone found. Connect a device and try again.';
-    } else if(e && e.name==='NotReadableError'){
-      msg += 'Your camera/mic is in use by another app. Close it and retry.';
-    } else if(e && e.name==='SecurityError'){
-      msg += 'Needs HTTPS/top-level context.';
-    } else {
-      msg += (e && e.message) ? e.message : String(e);
-    }
-    showErr(msg);
-    els.hint.style.display='block';
-    els.hint.textContent='Tip: reset permissions in Chrome → site settings for cambridgexr.github.io.';
-  }
-});
-
-els.camSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
-els.micSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
-
-els.startBtn.addEventListener('click', ()=>{
-  if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
-  samples=0; facingSamples=0; chunks.length=0;
-  setupRecorder(); mediaRecorder.start(); recording=true; paused=false;
-  els.startBtn.disabled=true; els.stopBtn.disabled=false; els.pauseBtn.disabled=false; els.resumeBtn.disabled=true;
-  startTimer();
-});
-
-els.pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; els.pauseBtn.disabled=true; els.resumeBtn.disabled=false; }});
-els.resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); paused=false; els.pauseBtn.disabled=false; els.resumeBtn.disabled=true; }});
-els.stopBtn.addEventListener('click', ()=>{
-  if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
-    mediaRecorder.stop(); recording=false; paused=false;
-    els.stopBtn.disabled=true; els.pauseBtn.disabled=true; els.resumeBtn.disabled=true; els.startBtn.disabled=false;
-    stopTimer();
-  }
-});
-
-// Early support checks
-(function(){
-  if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
-    els.perm.textContent='Unsupported browser';
-    showErr('Your browser does not support camera/microphone (missing navigator.mediaDevices.getUserMedia). Use latest Chrome/Edge/Firefox.');
-  }
-  if(typeof MediaRecorder==='undefined'){
-    showErr('Recording is not supported in this browser.');
-  }
-})();
-</script>
+<!-- Stable TFJS + BlazeFace (model hosted by Google) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
 </head>
 <body>
 <div class="wrap">
   <h1>🎤 Presentation Recorder</h1>
   <div class="grid">
+    <!-- Left: live preview + controls -->
     <div class="card">
       <div class="area">
         <video id="preview" playsinline autoplay muted></video>
         <canvas id="overlay"></canvas>
         <div class="water"><span id="liveDot" class="dot"></span> Live</div>
       </div>
-
       <div class="bar">
         <select id="camera"></select>
         <select id="microphone"></select>
-        <label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="mirror"> Mirror</label>
+        <label style="display:inline-flex;align-items:center;gap:6px">
+          <input type="checkbox" id="mirror"> Mirror
+        </label>
         <span class="tag" id="perm">Permissions: not requested</span>
       </div>
-
       <div class="bar">
         <button id="enable" class="primary">Enable camera & mic</button>
         <button id="start" disabled>Start</button>
@@ -304,28 +63,231 @@ els.stopBtn.addEventListener('click', ()=>{
         <a id="download" class="btn" download="practice.webm" style="display:none">Download</a>
         <span class="tag" id="timer">00:00</span>
       </div>
-
       <div id="err" class="err"></div>
       <div class="hint" id="hint" style="margin-top:6px;display:none"></div>
     </div>
 
+    <!-- Right: playback + analysis -->
     <div class="card">
       <div class="area" style="background:#05070f">
         <video id="playback" controls playsinline></video>
         <div class="water">Recorded</div>
       </div>
       <div class="bar">
+        <button id="analyze" disabled>Analyze Eye Contact</button>
+        <div class="progress"><span id="prog"></span></div>
+        <span class="tag" id="progText">0%</span>
+      </div>
+      <div class="bar">
         <div class="result" style="flex:1">
           <div>Eye contact</div>
           <div class="score" id="score">—%</div>
-          <div class="mini" id="scoreDetail">no recording yet</div>
+          <div class="mini" id="scoreDetail">no analysis yet</div>
         </div>
       </div>
       <div class="hint">
-        Eye Contact % is computed while recording by sampling frames when a single face is centered and eyes look forward (on-device; no upload).
+        Eye Contact % is computed after recording by sampling frames when one face is centered and appears front-facing.
       </div>
     </div>
   </div>
 </div>
-</body>
-</html>
+
+<script>
+(() => {
+  // ------ Elements
+  const v = document.getElementById('preview');
+  const pb = document.getElementById('playback');
+  const cv = document.getElementById('overlay');
+  const cx = cv.getContext('2d');
+  const camSel = document.getElementById('camera');
+  const micSel = document.getElementById('microphone');
+  const mirror = document.getElementById('mirror');
+  const perm = document.getElementById('perm');
+  const enableBtn = document.getElementById('enable');
+  const startBtn = document.getElementById('start');
+  const pauseBtn = document.getElementById('pause');
+  const resumeBtn = document.getElementById('resume');
+  const stopBtn = document.getElementById('stop');
+  const downloadLink = document.getElementById('download');
+  const timerEl = document.getElementById('timer');
+  const errBox = document.getElementById('err');
+  const hint = document.getElementById('hint');
+  const liveDot = document.getElementById('liveDot');
+  const analyzeBtn = document.getElementById('analyze');
+  const progBar = document.getElementById('prog');
+  const progText = document.getElementById('progText');
+  const scoreEl = document.getElementById('score');
+  const scoreDetail = document.getElementById('scoreDetail');
+
+  // ------ State
+  let stream=null, mediaRecorder=null, chunks=[];
+  let recording=false, paused=false;
+  let tIv=null, tStart=0;
+
+  // BlazeFace model
+  let blazeModel=null;
+
+  // ------ Utils
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
+  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
+  function startTimer(){ tStart=Date.now(); timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
+  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
+  function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
+
+  // ------ Device & Stream
+  async function listDevices(){
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    const mics = devs.filter(d=>d.kind==='audioinput');
+    camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
+    micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
+  }
+
+  async function preflightPermissions(){
+    perm.textContent = 'Permissions: requesting…';
+    const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+    pre.getTracks().forEach(t=>t.stop());
+  }
+
+  async function startStream(){
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: camSel.value? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+      audio: { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+    });
+    v.srcObject = stream; v.muted = true; await v.play();
+    liveDot.classList.add('live');
+    setCanvasSize();
+    drawGuide(); // draw guide box for centering
+  }
+
+  // ------ Recorder
+  function setupRecorder(){
+    chunks.length=0;
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
+                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
+    mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
+    mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = ()=>{
+      const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
+      const url = URL.createObjectURL(blob);
+      pb.src = url;
+      downloadLink.href = url;
+      downloadLink.style.display='inline-flex';
+      downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+      analyzeBtn.disabled = false; // enable analysis now that we have a recording
+    };
+  }
+
+  // ------ Live overlay guide (just a rectangle to help centering)
+  function drawGuide(){
+    requestAnimationFrame(drawGuide);
+    if(!v || v.readyState < 2) return;
+    setCanvasSize();
+    const W=cv.width, H=cv.height;
+    cx.clearRect(0,0,W,H);
+    cx.save();
+    if(mirror.checked){ cx.translate(W,0); cx.scale(-1,1); }
+    cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
+    // center “acceptable” zone
+    const gx=W*0.28, gy=H*0.25, gw=W*0.44, gh=H*0.5;
+    cx.strokeRect(gx,gy,gw,gh);
+    cx.restore();
+  }
+
+  // ------ Eye-contact heuristics (BlazeFace landmarks)
+  function facingHeuristic(face, W, H){
+    // Inputs: face.topLeft, face.bottomRight, face.landmarks: [rightEye, leftEye, nose, mouth, rightEar, leftEar]
+    const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
+    const cx=(x1+x2)/2, cy=(y1+y2)/2;
+    const areaRatio=((x2-x1)*(y2-y1))/(W*H);
+    const centerOk = (cx > W*0.28 && cx < W*0.72 && cy > H*0.25 && cy < H*0.75);
+    const sizeOk   = areaRatio > 0.035;
+
+    const Reye=face.landmarks[0], Leye=face.landmarks[1], Nose=face.landmarks[2], Rear=face.landmarks[4], Lear=face.landmarks[5];
+
+    // Eyes roughly level
+    const eyeDist = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
+    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDist < 0.18;
+
+    // Yaw ~ nose centered between ears
+    const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
+    const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
+    const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
+    const yawOk = yawSkew < 0.30;
+
+    // Pitch ~ nose near eye-line vertically relative to box height
+    const eyeMidY = (Leye[1]+Reye[1])/2;
+    const pitch = Math.abs(Nose[1]-eyeMidY) / ((y2-y1) || 1);
+    const pitchOk = pitch < 0.35;
+
+    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
+  }
+
+  // ------ Offline analyzer (runs AFTER recording)
+  async function analyzeEyeContact(videoURL){
+    // Load model once
+    if(!blazeModel){
+      // Ensure WebGL backend for speed
+      await tf.setBackend('webgl');
+      blazeModel = await blazeface.load(); // model + weights fetched from Google's tfjs-models storage
+    }
+
+    // Hidden video for seeking frames
+    const av = document.createElement('video');
+    av.src = videoURL;
+    av.crossOrigin = 'anonymous';
+    av.muted = true; // avoid autoplay warnings
+    av.playsInline = true;
+
+    await new Promise(res=> av.onloadedmetadata=res);
+    const duration = av.duration || 0;
+    if(!duration || !isFinite(duration)){ throw new Error('Could not read video duration.'); }
+
+    const W = pb.videoWidth || 1280, H = pb.videoHeight || 720;
+    const off = document.createElement('canvas');
+    off.width = W; off.height = H;
+    const ox = off.getContext('2d');
+
+    const targetFPS = 4;                // sample 4 frames per second
+    const step = 1/targetFPS;
+    let total=0, facing=0;
+
+    for(let t=0; t<duration; t+=step){
+      // Seek and wait
+      await new Promise((resolve)=>{
+        const onSeek = ()=>{ av.removeEventListener('seeked', onSeek); resolve(); };
+        av.addEventListener('seeked', onSeek);
+        av.currentTime = Math.min(t, duration - 0.05);
+      });
+
+      // Draw frame to offscreen canvas
+      ox.drawImage(av, 0, 0, W, H);
+
+      // Run face detection
+      const preds = await blazeModel.estimateFaces(off, false);
+      total++;
+
+      if(preds && preds.length===1){
+        if(facingHeuristic(preds[0], W, H)) facing++;
+      }
+
+      // Progress UI
+      const pct = Math.round(Math.min(100, (t/duration)*100));
+      progBar.style.width = pct + '%';
+      progText.textContent = pct + '%';
+    }
+
+    // Finish
+    progBar.style.width = '100%';
+    progText.textContent = '100%';
+
+    const percent = total ? Math.round((facing/total)*100) : 0;
+    scoreEl.textContent = percent + '%';
+    scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
+    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
+  }
+
+  // ------ UI wiring
+  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1
