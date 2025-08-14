@@ -29,11 +29,253 @@
   .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none;white-space:pre-line}
   .hint{font-size:12px;color:var(--muted)}
 </style>
-<!-- TFJS + BlazeFace (for robust face/landmarks on Chrome/Windows) -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.14.0/dist/tf-core.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.14.0/dist/tf-converter.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.14.0/dist/tf-backend-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
+<!-- MediaPipe Tasks Vision (Face Landmarker + blendshapes) -->
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13";
+
+const els = {
+  v: document.getElementById('preview'),
+  pb: document.getElementById('playback'),
+  cv: document.getElementById('overlay'),
+  camSel: document.getElementById('camera'),
+  micSel: document.getElementById('microphone'),
+  mirror: document.getElementById('mirror'),
+  perm: document.getElementById('perm'),
+  enableBtn: document.getElementById('enable'),
+  startBtn: document.getElementById('start'),
+  pauseBtn: document.getElementById('pause'),
+  resumeBtn: document.getElementById('resume'),
+  stopBtn: document.getElementById('stop'),
+  downloadLink: document.getElementById('download'),
+  timerEl: document.getElementById('timer'),
+  errBox: document.getElementById('err'),
+  hint: document.getElementById('hint'),
+  liveDot: document.getElementById('liveDot'),
+  scoreEl: document.getElementById('score'),
+  scoreDetail: document.getElementById('scoreDetail'),
+};
+const cx = els.cv.getContext('2d');
+
+let stream=null, mediaRecorder=null, chunks=[];
+let faceLandmarker=null, running=false;
+let recording=false, paused=false;
+let samples=0, facingSamples=0, sampleFPS=10, lastSampleTs=0;
+
+function showErr(msg){ els.errBox.textContent = msg; els.errBox.style.display = 'block'; }
+function clearErr(){ els.errBox.style.display='none'; els.errBox.textContent=''; }
+
+function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
+let tIv=null, tStart=0;
+function startTimer(){ tStart=Date.now(); els.timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ els.timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
+function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
+
+function setCanvasSize(){
+  const w=els.v.videoWidth||els.cv.clientWidth, h=els.v.videoHeight||els.cv.clientHeight;
+  if(w&&h){ els.cv.width=w; els.cv.height=h; }
+}
+
+async function listDevices(){
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  const cams = devs.filter(d=>d.kind==='videoinput');
+  const mics = devs.filter(d=>d.kind==='audioinput');
+  els.camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
+  els.micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
+}
+
+async function preflightPermissions(){
+  els.perm.textContent='Permissions: requesting…';
+  const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+  pre.getTracks().forEach(t=>t.stop());
+}
+
+async function startStream(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { deviceId: els.camSel.value? {exact:els.camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+    audio: { deviceId: els.micSel.value? {exact:els.micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+  });
+  els.v.srcObject = stream; els.v.muted = true; await els.v.play();
+  els.liveDot.classList.add('live');
+  setCanvasSize();
+}
+
+function setupRecorder(){
+  chunks.length=0;
+  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
+               MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
+  mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
+  mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+  mediaRecorder.onstop = ()=>{
+    const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
+    const url = URL.createObjectURL(blob);
+    els.pb.src = url; els.downloadLink.href = url; els.downloadLink.style.display='inline-flex';
+    els.downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+
+    const pct = samples? Math.round((facingSamples/samples)*100): 0;
+    els.scoreEl.textContent = pct + '%';
+    els.scoreEl.style.color = pct>=70? 'var(--ok)' : pct>=40? 'var(--warn)' : 'var(--bad)';
+    els.scoreDetail.textContent = `${facingSamples} of ${samples} sampled frames (~${sampleFPS} fps)`;
+  };
+}
+
+// ---------- Face Landmarker setup + Eye Contact logic ----------
+function getBlend(cats, name){ const c = cats.find(x=>x.categoryName===name); return c? c.score : 0; }
+
+// Decide if “facing camera” using: centered + large enough + eyes looking forward (blendshapes small)
+function isFacing(landmarks, cats, W, H){
+  // bbox from landmarks (normalized [0..1])
+  let minX=1, minY=1, maxX=0, maxY=0;
+  for(const p of landmarks){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; }
+  const w=(maxX-minX)*W, h=(maxY-minY)*H;
+  const cx=(minX+maxX)/2*W, cy=(minY+maxY)/2*H;
+
+  const centerOk = (cx > W*0.28 && cx < W*0.72 && cy > H*0.25 && cy < H*0.75);
+  const sizeOk   = (w*h)/(W*H) > 0.035; // ~3.5% of frame
+
+  // Eye-gaze “forwardness”: sum of eyeLook* blendshapes should be small when looking forward
+  const lookSum =
+    getBlend(cats,'eyeLookInLeft') + getBlend(cats,'eyeLookOutLeft') +
+    getBlend(cats,'eyeLookUpLeft') + getBlend(cats,'eyeLookDownLeft') +
+    getBlend(cats,'eyeLookInRight') + getBlend(cats,'eyeLookOutRight') +
+    getBlend(cats,'eyeLookUpRight') + getBlend(cats,'eyeLookDownRight');
+
+  const gazeOk = lookSum < 0.9; // threshold tuned for TF/MediaPipe scales (0..1)
+
+  return centerOk && sizeOk && gazeOk;
+}
+
+function drawOverlay(landmarks, W, H, mirror){
+  cx.clearRect(0,0,W,H);
+  cx.save();
+  if(mirror){ cx.translate(W,0); cx.scale(-1,1); }
+
+  // bbox
+  let minX=1, minY=1, maxX=0, maxY=0;
+  for(const p of landmarks){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; }
+  cx.lineWidth=2; cx.strokeStyle='rgba(122,162,255,0.95)';
+  cx.strokeRect(minX*W, minY*H, (maxX-minX)*W, (maxY-minY)*H);
+
+  // a few landmark dots (every ~20th to avoid too many)
+  cx.fillStyle='rgba(122,162,255,0.95)';
+  for(let i=0;i<landmarks.length;i+=20){
+    const p=landmarks[i]; cx.beginPath(); cx.arc(p.x*W, p.y*H, 2.5, 0, Math.PI*2); cx.fill();
+  }
+
+  cx.restore();
+}
+
+async function initFaceLandmarker(){
+  if(faceLandmarker) return;
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13/wasm"
+  );
+  faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13/wasm/face_landmarker.task"
+    },
+    runningMode: "VIDEO",
+    numFaces: 1,
+    outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: false
+  });
+}
+
+function detectLoop(){
+  if(!running) return;
+  requestAnimationFrame(detectLoop);
+  if(!els.v || els.v.readyState < 2) return;
+
+  setCanvasSize();
+  const W = els.cv.width, H = els.cv.height;
+  const ts = performance.now();
+  const res = faceLandmarker.detectForVideo(els.v, ts);
+  const faces = res.faceLandmarks || [];
+  const shapes = res.faceBlendshapes || [];
+
+  if(faces.length){
+    drawOverlay(faces[0], W, H, els.mirror.checked);
+
+    // Sample toward Eye Contact % while recording
+    const now = performance.now();
+    if(recording && !paused && (now - lastSampleTs) > (1000/sampleFPS)){
+      lastSampleTs = now;
+      samples++;
+      const cats = (shapes[0] && shapes[0].categories) ? shapes[0].categories : [];
+      if(isFacing(faces[0], cats, W, H)) facingSamples++;
+    }
+  }else{
+    cx.clearRect(0,0,W,H);
+  }
+}
+// ---------------------------------------------------------------
+
+// UI handlers
+els.mirror.addEventListener('change', ()=>{ els.v.style.transform = els.mirror.checked? 'scaleX(-1)':'none'; });
+
+els.enableBtn.addEventListener('click', async ()=>{
+  clearErr();
+  try{
+    await preflightPermissions();   // user-gesture prompt
+    await listDevices();            // device labels
+    await startStream();            // real stream
+    await initFaceLandmarker();     // load model (once)
+    els.perm.textContent='Permissions: granted';
+    els.enableBtn.disabled=true;
+    els.startBtn.disabled=false;
+    running = true; detectLoop();
+  }catch(e){
+    console.error(e);
+    els.perm.textContent='Permissions: denied';
+    let msg = 'Unable to access camera/microphone.\n\n';
+    if(e && e.name==='NotAllowedError'){
+      msg += 'Access was blocked. Chrome: click the lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.';
+    } else if(e && e.name==='NotFoundError'){
+      msg += 'No camera/microphone found. Connect a device and try again.';
+    } else if(e && e.name==='NotReadableError'){
+      msg += 'Your camera/mic is in use by another app. Close it and retry.';
+    } else if(e && e.name==='SecurityError'){
+      msg += 'Needs HTTPS/top-level context.';
+    } else {
+      msg += (e && e.message) ? e.message : String(e);
+    }
+    showErr(msg);
+    els.hint.style.display='block';
+    els.hint.textContent='Tip: reset permissions in Chrome → site settings for cambridgexr.github.io.';
+  }
+});
+
+els.camSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
+els.micSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
+
+els.startBtn.addEventListener('click', ()=>{
+  if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
+  samples=0; facingSamples=0; chunks.length=0;
+  setupRecorder(); mediaRecorder.start(); recording=true; paused=false;
+  els.startBtn.disabled=true; els.stopBtn.disabled=false; els.pauseBtn.disabled=false; els.resumeBtn.disabled=true;
+  startTimer();
+});
+
+els.pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; els.pauseBtn.disabled=true; els.resumeBtn.disabled=false; }});
+els.resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); paused=false; els.pauseBtn.disabled=false; els.resumeBtn.disabled=true; }});
+els.stopBtn.addEventListener('click', ()=>{
+  if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
+    mediaRecorder.stop(); recording=false; paused=false;
+    els.stopBtn.disabled=true; els.pauseBtn.disabled=true; els.resumeBtn.disabled=true; els.startBtn.disabled=false;
+    stopTimer();
+  }
+});
+
+// Early support checks
+(function(){
+  if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
+    els.perm.textContent='Unsupported browser';
+    showErr('Your browser does not support camera/microphone (missing navigator.mediaDevices.getUserMedia). Use latest Chrome/Edge/Firefox.');
+  }
+  if(typeof MediaRecorder==='undefined'){
+    showErr('Recording is not supported in this browser.');
+  }
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -80,244 +322,10 @@
         </div>
       </div>
       <div class="hint">
-        Eye Contact % is computed while recording by sampling frames when one face looks roughly forward and is centered.
+        Eye Contact % is computed while recording by sampling frames when a single face is centered and eyes look forward (on-device; no upload).
       </div>
     </div>
   </div>
 </div>
-
-<script>
-(() => {
-  // Elements
-  const v = document.getElementById('preview');
-  const pb = document.getElementById('playback');
-  const cv = document.getElementById('overlay');
-  const cx = cv.getContext('2d');
-  const camSel = document.getElementById('camera');
-  const micSel = document.getElementById('microphone');
-  const mirror = document.getElementById('mirror');
-  const perm = document.getElementById('perm');
-  const enableBtn = document.getElementById('enable');
-  const startBtn = document.getElementById('start');
-  const pauseBtn = document.getElementById('pause');
-  const resumeBtn = document.getElementById('resume');
-  const stopBtn = document.getElementById('stop');
-  const downloadLink = document.getElementById('download');
-  const timerEl = document.getElementById('timer');
-  const errBox = document.getElementById('err');
-  const hint = document.getElementById('hint');
-  const liveDot = document.getElementById('liveDot');
-
-  // State
-  let stream=null, mediaRecorder=null, chunks=[];
-  let model=null, detecting=false, rafId=null;
-  let recording=false, paused=false;
-  let samples=0, facingSamples=0, sampleFPS=10, lastSampleTs=0;
-
-  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
-  function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
-
-  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
-  let tIv=null, tStart=0;
-  function startTimer(){ tStart=Date.now(); timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
-  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
-
-  function setCanvasSize(){
-    const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight;
-    if(w&&h){ cv.width=w; cv.height=h; }
-  }
-
-  async function listDevices(){
-    const devs = await navigator.mediaDevices.enumerateDevices();
-    const cams = devs.filter(d=>d.kind==='videoinput');
-    const mics = devs.filter(d=>d.kind==='audioinput');
-    camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
-    micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
-  }
-
-  async function preflightPermissions(){
-    perm.textContent='Permissions: requesting…';
-    const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
-    pre.getTracks().forEach(t=>t.stop());
-  }
-
-  async function startStream(){
-    if(stream) stream.getTracks().forEach(t=>t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: camSel.value? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
-      audio: { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-    });
-    v.srcObject = stream; v.muted = true; await v.play();
-    liveDot.classList.add('live');
-    setCanvasSize();
-  }
-
-  function setupRecorder(){
-    chunks.length=0;
-    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':
-                 'video/webm';
-    mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
-    mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
-    mediaRecorder.onstop = ()=>{
-      const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
-      const url = URL.createObjectURL(blob);
-      pb.src = url;
-      downloadLink.href = url;
-      downloadLink.style.display='inline-flex';
-      downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
-
-      // Final eye contact score
-      const pct = samples? Math.round((facingSamples/samples)*100): 0;
-      const scoreEl = document.getElementById('score');
-      const scoreDetail = document.getElementById('scoreDetail');
-      scoreEl.textContent = pct + '%';
-      scoreEl.style.color = pct>=70? 'var(--ok)' : pct>=40? 'var(--warn)' : 'var(--bad)';
-      scoreDetail.textContent = `${facingSamples} of ${samples} sampled frames (~${sampleFPS} fps)`;
-    };
-  }
-
-  // ---------- Eye contact via BlazeFace ----------
-  function drawBox(face){
-    const [x1,y1] = face.topLeft;
-    const [x2,y2] = face.bottomRight;
-    cx.lineWidth=2;
-    cx.strokeStyle='rgba(122,162,255,0.95)';
-    cx.strokeRect(x1,y1,x2-x1,y2-y1);
-
-    // Landmarks
-    cx.fillStyle='rgba(122,162,255,0.95)';
-    face.landmarks.forEach(([x,y])=>{ cx.beginPath(); cx.arc(x,y,3,0,Math.PI*2); cx.fill(); });
-  }
-
-  // Heuristic: “facing” if (a) centered (b) big enough (c) eyes level (d) nose is midway between ears.
-  function isFacingFromLandmarks(face, w, h){
-    const lms = face.landmarks; if(!lms || lms.length<6) return false;
-    // BlazeFace order: rightEye, leftEye, nose, mouth, rightEar, leftEar
-    const Reye = lms[0], Leye = lms[1], Nose = lms[2], Rear = lms[4], Lear = lms[5];
-
-    // Center check (use bbox center)
-    const [x1,y1] = face.topLeft, [x2,y2] = face.bottomRight;
-    const cxFace = (x1+x2)/2, cyFace = (y1+y2)/2;
-    const centerOk = (cxFace > w*0.28 && cxFace < w*0.72 && cyFace > h*0.25 && cyFace < h*0.75);
-
-    // Size check
-    const areaRatio = ((x2-x1)*(y2-y1)) / (w*h);
-    const sizeOk = areaRatio > 0.03;
-
-    // Eyes level
-    const eyeDx = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
-    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDx < 0.18;
-
-    // Yaw approx: nose distance to ears should be similar
-    const dN_L = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
-    const dN_R = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
-    const yawSkew = Math.abs(dN_L - dN_R) / ((dN_L + dN_R)/2 || 1);
-    const yawOk = yawSkew < 0.30;
-
-    // Pitch approx: nose relative to eye midline
-    const eyeMidY = (Leye[1]+Reye[1])/2;
-    const eyeToNose = Math.abs(Nose[1]-eyeMidY) / (y2-y1 || 1);
-    const pitchOk = eyeToNose < 0.30;
-
-    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
-  }
-
-  async function ensureModel(){
-    if(model) return;
-    await tf.setBackend('webgl');
-    model = await blazeface.load();
-  }
-
-  function detectLoop(){
-    if(!model || !v || v.readyState < 2) { rafId = requestAnimationFrame(detectLoop); return; }
-    setCanvasSize();
-    cx.clearRect(0,0,cv.width,cv.height);
-
-    // Mirror overlay to match video if needed
-    cx.save();
-    if(mirror.checked){ cx.translate(cv.width,0); cx.scale(-1,1); }
-
-    model.estimateFaces(v, false).then(preds=>{
-      preds.forEach(face => drawBox(face));
-
-      const now = performance.now();
-      if(recording && !paused && (now - lastSampleTs) > (1000/sampleFPS)){
-        lastSampleTs = now;
-        samples++;
-        if(preds.length===1 && isFacingFromLandmarks(preds[0], cv.width, cv.height)) facingSamples++;
-      }
-    }).catch(()=>{ /* ignore transient errors */ }).finally(()=>{
-      cx.restore();
-      rafId = requestAnimationFrame(detectLoop);
-    });
-  }
-  // ---------------------------------------------
-
-  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
-
-  enableBtn.addEventListener('click', async ()=>{
-    clearErr();
-    try{
-      await preflightPermissions();   // user-gesture prompt
-      await listDevices();            // readable labels
-      await startStream();            // actual stream
-      await ensureModel();            // load face model once
-      perm.textContent='Permissions: granted';
-      enableBtn.disabled=true;
-      startBtn.disabled=false;
-      detectLoop();
-    }catch(e){
-      console.error(e);
-      perm.textContent='Permissions: denied';
-      let msg = 'Unable to access camera/microphone.\n\n';
-      if(e && e.name==='NotAllowedError'){
-        msg += 'Access was blocked. In Chrome: click the lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.';
-      } else if(e && e.name==='NotFoundError'){
-        msg += 'No camera/microphone found. Connect a device and try again.';
-      } else if(e && e.name==='NotReadableError'){
-        msg += 'Your camera/mic is in use by another app. Close it and retry.';
-      } else if(e && e.name==='SecurityError'){
-        msg += 'Needs HTTPS/top-level context.';
-      } else {
-        msg += (e && e.message) ? e.message : String(e);
-      }
-      showErr(msg);
-      hint.style.display='block';
-      hint.textContent='Tip: you can reset permissions in Chrome → site settings for cambridgexr.github.io.';
-    }
-  });
-
-  camSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
-  micSel.addEventListener('change', async ()=>{ try{ await startStream(); }catch(e){} });
-
-  startBtn.addEventListener('click', ()=>{
-    if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
-    samples=0; facingSamples=0; chunks.length=0;
-    setupRecorder(); mediaRecorder.start(); recording=true; paused=false;
-    startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
-    startTimer();
-  });
-
-  pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; pauseBtn.disabled=true; resumeBtn.disabled=false; }});
-  resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); paused=false; pauseBtn.disabled=false; resumeBtn.disabled=true; }});
-  stopBtn.addEventListener('click', ()=>{
-    if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
-      mediaRecorder.stop(); recording=false; paused=false;
-      stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false;
-      stopTimer();
-    }
-  });
-
-  // Early checks
-  if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
-    perm.textContent='Unsupported browser';
-    showErr('Your browser does not support camera/microphone (missing navigator.mediaDevices.getUserMedia). Try the latest Chrome/Edge/Firefox.');
-  }
-  if(typeof MediaRecorder==='undefined'){
-    showErr('Recording is not supported in this browser.');
-  }
-})();
-</script>
 </body>
 </html>
