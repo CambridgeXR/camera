@@ -31,7 +31,7 @@
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
-<!-- Stable TFJS + BlazeFace (model hosted by Google) -->
+<!-- Stable TFJS + BlazeFace -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
 </head>
@@ -39,7 +39,7 @@
 <div class="wrap">
   <h1>🎤 Presentation Recorder</h1>
   <div class="grid">
-    <!-- Left: live preview + controls -->
+    <!-- Live + controls -->
     <div class="card">
       <div class="area">
         <video id="preview" playsinline autoplay muted></video>
@@ -49,9 +49,7 @@
       <div class="bar">
         <select id="camera"></select>
         <select id="microphone"></select>
-        <label style="display:inline-flex;align-items:center;gap:6px">
-          <input type="checkbox" id="mirror"> Mirror
-        </label>
+        <label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="mirror"> Mirror</label>
         <span class="tag" id="perm">Permissions: not requested</span>
       </div>
       <div class="bar">
@@ -67,7 +65,7 @@
       <div class="hint" id="hint" style="margin-top:6px;display:none"></div>
     </div>
 
-    <!-- Right: playback + analysis -->
+    <!-- Playback + analysis -->
     <div class="card">
       <div class="area" style="background:#05070f">
         <video id="playback" controls playsinline></video>
@@ -86,7 +84,7 @@
         </div>
       </div>
       <div class="hint">
-        Eye Contact % is computed after recording by sampling frames when one face is centered and appears front-facing.
+        Eye Contact % is computed after recording by sampling frames when one face is centered and roughly front-facing (on-device; no upload).
       </div>
     </div>
   </div>
@@ -94,7 +92,7 @@
 
 <script>
 (() => {
-  // ------ Elements
+  // ---------- Elements ----------
   const v = document.getElementById('preview');
   const pb = document.getElementById('playback');
   const cv = document.getElementById('overlay');
@@ -119,15 +117,13 @@
   const scoreEl = document.getElementById('score');
   const scoreDetail = document.getElementById('scoreDetail');
 
-  // ------ State
+  // ---------- State ----------
   let stream=null, mediaRecorder=null, chunks=[];
   let recording=false, paused=false;
   let tIv=null, tStart=0;
-
-  // BlazeFace model
   let blazeModel=null;
 
-  // ------ Utils
+  // ---------- Utils ----------
   function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
   function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
   function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
@@ -135,7 +131,7 @@
   function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
   function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
 
-  // ------ Device & Stream
+  // ---------- Devices & stream ----------
   async function listDevices(){
     const devs = await navigator.mediaDevices.enumerateDevices();
     const cams = devs.filter(d=>d.kind==='videoinput');
@@ -144,29 +140,46 @@
     micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
   }
 
-  async function preflightPermissions(){
-    perm.textContent = 'Permissions: requesting…';
-    const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
-    pre.getTracks().forEach(t=>t.stop());
+  // Request permissions robustly: try video+audio; if that fails, try video only
+  async function requestPermissionsRobust() {
+    perm.textContent='Permissions: requesting…';
+    try{
+      const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
+      pre.getTracks().forEach(t=>t.stop());
+      return {video:true, audio:true};
+    }catch(e1){
+      // Fallback to camera-only
+      try{
+        const pre2 = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+        pre2.getTracks().forEach(t=>t.stop());
+        hint.style.display='block';
+        hint.textContent='Microphone access failed or not available. Continuing with camera-only.';
+        return {video:true, audio:false};
+      }catch(e2){
+        throw e1; // original error with audio+video usually more informative
+      }
+    }
   }
 
-  async function startStream(){
+  async function startStream(wantAudio=true){
     if(stream) stream.getTracks().forEach(t=>t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({
+    const constraints = {
       video: { deviceId: camSel.value? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
-      audio: { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
-    });
+      audio: wantAudio ? { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true } : false
+    };
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
     v.srcObject = stream; v.muted = true; await v.play();
     liveDot.classList.add('live');
     setCanvasSize();
-    drawGuide(); // draw guide box for centering
+    drawGuide();
   }
 
-  // ------ Recorder
+  // ---------- Recorder ----------
   function setupRecorder(){
     chunks.length=0;
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
+                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':
+                 'video/webm';
     mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
     mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
     mediaRecorder.onstop = ()=>{
@@ -176,11 +189,11 @@
       downloadLink.href = url;
       downloadLink.style.display='inline-flex';
       downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
-      analyzeBtn.disabled = false; // enable analysis now that we have a recording
+      analyzeBtn.disabled = false; // can analyze now
     };
   }
 
-  // ------ Live overlay guide (just a rectangle to help centering)
+  // ---------- Overlay guide ----------
   function drawGuide(){
     requestAnimationFrame(drawGuide);
     if(!v || v.readyState < 2) return;
@@ -190,15 +203,14 @@
     cx.save();
     if(mirror.checked){ cx.translate(W,0); cx.scale(-1,1); }
     cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
-    // center “acceptable” zone
     const gx=W*0.28, gy=H*0.25, gw=W*0.44, gh=H*0.5;
     cx.strokeRect(gx,gy,gw,gh);
     cx.restore();
   }
+  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
 
-  // ------ Eye-contact heuristics (BlazeFace landmarks)
+  // ---------- Eye contact (post-recording) ----------
   function facingHeuristic(face, W, H){
-    // Inputs: face.topLeft, face.bottomRight, face.landmarks: [rightEye, leftEye, nose, mouth, rightEar, leftEar]
     const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
     const cx=(x1+x2)/2, cy=(y1+y2)/2;
     const areaRatio=((x2-x1)*(y2-y1))/(W*H);
@@ -206,18 +218,12 @@
     const sizeOk   = areaRatio > 0.035;
 
     const Reye=face.landmarks[0], Leye=face.landmarks[1], Nose=face.landmarks[2], Rear=face.landmarks[4], Lear=face.landmarks[5];
-
-    // Eyes roughly level
     const eyeDist = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
     const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDist < 0.18;
-
-    // Yaw ~ nose centered between ears
     const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
     const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
     const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
     const yawOk = yawSkew < 0.30;
-
-    // Pitch ~ nose near eye-line vertically relative to box height
     const eyeMidY = (Leye[1]+Reye[1])/2;
     const pitch = Math.abs(Nose[1]-eyeMidY) / ((y2-y1) || 1);
     const pitchOk = pitch < 0.35;
@@ -225,69 +231,10 @@
     return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
   }
 
-  // ------ Offline analyzer (runs AFTER recording)
   async function analyzeEyeContact(videoURL){
-    // Load model once
     if(!blazeModel){
-      // Ensure WebGL backend for speed
-      await tf.setBackend('webgl');
-      blazeModel = await blazeface.load(); // model + weights fetched from Google's tfjs-models storage
+      await tf.setBackend('webgl'); // performance
+      blazeModel = await blazeface.load(); // loads from stable tfjs-models host
     }
 
-    // Hidden video for seeking frames
-    const av = document.createElement('video');
-    av.src = videoURL;
-    av.crossOrigin = 'anonymous';
-    av.muted = true; // avoid autoplay warnings
-    av.playsInline = true;
-
-    await new Promise(res=> av.onloadedmetadata=res);
-    const duration = av.duration || 0;
-    if(!duration || !isFinite(duration)){ throw new Error('Could not read video duration.'); }
-
-    const W = pb.videoWidth || 1280, H = pb.videoHeight || 720;
-    const off = document.createElement('canvas');
-    off.width = W; off.height = H;
-    const ox = off.getContext('2d');
-
-    const targetFPS = 4;                // sample 4 frames per second
-    const step = 1/targetFPS;
-    let total=0, facing=0;
-
-    for(let t=0; t<duration; t+=step){
-      // Seek and wait
-      await new Promise((resolve)=>{
-        const onSeek = ()=>{ av.removeEventListener('seeked', onSeek); resolve(); };
-        av.addEventListener('seeked', onSeek);
-        av.currentTime = Math.min(t, duration - 0.05);
-      });
-
-      // Draw frame to offscreen canvas
-      ox.drawImage(av, 0, 0, W, H);
-
-      // Run face detection
-      const preds = await blazeModel.estimateFaces(off, false);
-      total++;
-
-      if(preds && preds.length===1){
-        if(facingHeuristic(preds[0], W, H)) facing++;
-      }
-
-      // Progress UI
-      const pct = Math.round(Math.min(100, (t/duration)*100));
-      progBar.style.width = pct + '%';
-      progText.textContent = pct + '%';
-    }
-
-    // Finish
-    progBar.style.width = '100%';
-    progText.textContent = '100%';
-
-    const percent = total ? Math.round((facing/total)*100) : 0;
-    scoreEl.textContent = percent + '%';
-    scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
-    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
-  }
-
-  // ------ UI wiring
-  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1
+    const av = document.createElement(
