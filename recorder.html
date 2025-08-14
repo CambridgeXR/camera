@@ -88,7 +88,7 @@
 
 <script>
 (() => {
-  // =================== DOM ===================
+  // ---------- Elements ----------
   const v = document.getElementById('preview');
   const pb = document.getElementById('playback');
   const cv = document.getElementById('overlay');
@@ -112,19 +112,19 @@
   const scoreEl = document.getElementById('score');
   const scoreDetail = document.getElementById('scoreDetail');
 
-  // =================== State ===================
+  // ---------- State ----------
   let stream=null, mediaRecorder=null, chunks=[];
   let timerIv=null;
 
-  // =================== Utils ===================
-  function showErr(msg){ errBox.textContent = msg; errBox.style.display='block'; }
+  // ---------- Utils ----------
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
   function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
   function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
   function startTimer(){ const t0=Date.now(); if(timerIv) clearInterval(timerIv); timerIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-t0)/1000); },250); }
   function stopTimer(){ if(timerIv) clearInterval(timerIv); timerIv=null; }
   function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
 
-  // =================== Device & Stream ===================
+  // ---------- Devices & stream ----------
   async function listDevices(){
     const devs = await navigator.mediaDevices.enumerateDevices();
     const cams = devs.filter(d=>d.kind==='videoinput');
@@ -140,12 +140,10 @@
       pre.getTracks().forEach(t=>t.stop());
       return {video:true, audio:true};
     }catch(e1){
-      // Fallback to camera-only
       try{
         const pre2 = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
         pre2.getTracks().forEach(t=>t.stop());
-        hint.style.display='block';
-        hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
+        hint.style.display='block'; hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
         return {video:true, audio:false};
       }catch(e2){ throw e1; }
     }
@@ -154,7 +152,7 @@
   async function startStream(wantAudio=true){
     if(stream) stream.getTracks().forEach(t=>t.stop());
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: camSel.value ? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+      video:{ deviceId: camSel.value?{exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
       audio: wantAudio ? { deviceId: micSel.value?{exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true } : false
     });
     v.srcObject = stream; v.muted = true; await v.play();
@@ -163,12 +161,11 @@
     drawGuide();
   }
 
-  // =================== Recorder ===================
+  // ---------- Recorder ----------
   function setupRecorder(){
     chunks.length=0;
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':
-                 'video/webm';
+                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
     mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
     mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
     mediaRecorder.onstop = ()=>{
@@ -181,7 +178,7 @@
     };
   }
 
-  // =================== Overlay guide (no mirroring) ===================
+  // ---------- Overlay guide (just a generous center box) ----------
   function drawGuide(){
     requestAnimationFrame(drawGuide);
     if(!v || v.readyState<2) return;
@@ -189,12 +186,11 @@
     const W=cv.width, H=cv.height;
     cx.clearRect(0,0,W,H);
     cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
-    // generous acceptance window so straight-on reads ~100%
     const gx=W*0.20, gy=H*0.20, gw=W*0.60, gh=H*0.60;
     cx.strokeRect(gx,gy,gw,gh);
   }
 
-  // =================== Safe dynamic script loader (for analysis only) ===================
+  // ---------- Lazy-load TFJS + BlazeFace only when analyzing ----------
   function loadScript(src){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script');
@@ -202,47 +198,27 @@
       document.head.appendChild(s);
     });
   }
-
-  async function ensureFaceModel(){
-    if(window.blazeface && window.tf && window.__blazeModel) return window.__blazeModel;
+  async function ensureModel(){
+    if(window.__blazeModel) return window.__blazeModel;
     if(!window.tf) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js');
     if(!window.blazeface) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js');
-    try{ await tf.setBackend('webgl'); }catch(_){} // best-effort
+    try{ await tf.setBackend('webgl'); }catch(_){} // best effort
     window.__blazeModel = await blazeface.load();
     return window.__blazeModel;
   }
 
-  // =================== Facing-forward heuristic (pose-only, lenient) ===================
-  function forwardFacing(face, W, H){
+  // ---------- Super-lenient “facing forward” rule ----------
+  // A frame counts as 'forward' if:
+  //  - a face is detected (probability >= 0.6), and
+  //  - the face bbox covers at least 1.2% of the frame area (so the face is visible).
+  function isForward(face, W, H){
+    const prob = Array.isArray(face.probability) ? face.probability[0] : (face.probability||0.0);
     const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
-    const cx=(x1+x2)/2, cy=(y1+y2)/2;
-    const w=(x2-x1), h=(y2-y1);
-    const areaRatio=(w*h)/(W*H);
-
-    const centerOk = (cx > W*0.18 && cx < W*0.82 && cy > H*0.16 && cy < H*0.84);
-    const sizeOk   = areaRatio > 0.018;
-
-    const lm = face.landmarks || [];
-    if(lm.length < 6) return centerOk && sizeOk;
-
-    const Reye=lm[0], Leye=lm[1], Nose=lm[2], Rear=lm[4], Lear=lm[5];
-
-    const eyeDx = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
-    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDx < 0.25;  // lenient
-
-    const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
-    const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
-    const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
-    const yawOk = yawSkew < 0.45; // lenient
-
-    const eyeMidY = (Leye[1]+Reye[1])/2;
-    const pitch = Math.abs(Nose[1]-eyeMidY) / (h || 1);
-    const pitchOk = pitch < 0.45; // lenient
-
-    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
+    const areaRatio = ((x2-x1)*(y2-y1))/(W*H);
+    return (prob >= 0.6) && (areaRatio >= 0.012);
   }
 
-  // =================== Duration fix for WebM blobs ===================
+  // Some browsers report Infinity duration for fresh blobs; nudge it to resolve.
   function loadVideoForAnalysis(src){
     return new Promise((resolve, reject)=>{
       const av=document.createElement('video');
@@ -264,30 +240,44 @@
     });
   }
 
-  // =================== Analyzer (post-recording) ===================
+  // ---------- Analyzer ----------
   async function analyze(videoURL){
     if(!videoURL) throw new Error('No video to analyze.');
-    const model = await ensureFaceModel();
+    const model = await ensureModel();
     const av = await loadVideoForAnalysis(videoURL);
 
-    const W = av.videoWidth || 1280, H = av.videoHeight || 720;
-    const off = document.createElement('canvas'); off.width=W; off.height=H;
+    // Downscale to help detection and keep ratios consistent
+    const fullW = av.videoWidth || 1280, fullH = av.videoHeight || 720;
+    const smallW = Math.min(640, fullW);
+    const smallH = Math.round(fullH * (smallW/fullW));
+    const off = document.createElement('canvas'); off.width=smallW; off.height=smallH;
     const ox = off.getContext('2d');
 
     const duration = av.duration;
-    const fps = 6;
+    const fps = 4;                             // 4 fps sampling
     const steps = Math.max(1, Math.floor(duration * fps));
     let total=0, facing=0;
 
     for(let i=0;i<steps;i++){
       const t = Math.min(duration - 0.05, i/fps);
       await new Promise((resolve)=>{ const onSeek=()=>{ av.removeEventListener('seeked',onSeek); resolve(); }; av.addEventListener('seeked',onSeek); av.currentTime=t; });
-      ox.drawImage(av, 0, 0, W, H);
 
-      const preds = await model.estimateFaces(off, false);
+      ox.drawImage(av, 0, 0, smallW, smallH);
+
+      let preds = await model.estimateFaces(off, false);
+      // If nothing found, try a second pass with horizontally flipped input (rare cam drivers)
+      if(!preds || !preds.length){
+        // flip to temp canvas
+        const tmp = document.createElement('canvas'); tmp.width=smallW; tmp.height=smallH;
+        const tx = tmp.getContext('2d'); tx.translate(smallW,0); tx.scale(-1,1); tx.drawImage(off,0,0);
+        preds = await model.estimateFaces(tmp, false);
+      }
+
       total++;
-      if(preds && preds.length===1){
-        if(forwardFacing(preds[0], W, H)) facing++;
+      if(preds && preds.length>=1){
+        // accept the strongest face
+        const face = preds.reduce((a,b)=> ((a.probability?.[0]||0)>(b.probability?.[0]||0)?a:b));
+        if(isForward(face, smallW, smallH)) facing++;
       }
 
       const pct = Math.round((i+1)/steps*100);
@@ -300,7 +290,7 @@
     scoreDetail.textContent = `${facing} of ${total} sampled frames (~${fps} fps)`;
   }
 
-  // =================== Handlers ===================
+  // ---------- Handlers ----------
   enableBtn.addEventListener('click', async ()=>{
     clearErr();
     try{
@@ -351,7 +341,7 @@
     finally{ analyzeBtn.disabled=false; }
   });
 
-  // Early support checks
+  // Early checks
   (function(){
     if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
       perm.textContent='Unsupported browser';
@@ -361,9 +351,6 @@
       showErr('Recording is not supported in this browser.');
     }
   })();
-
-  // Global error surfacing so a script error never silently kills the Enable button
-  window.addEventListener('error', e => { showErr('Runtime error: '+ (e.message||e.error||'unknown')); });
 })();
 </script>
 </body>
