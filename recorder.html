@@ -26,7 +26,7 @@
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#7683a8}
   .dot.live{background:#ff5a5a;box-shadow:0 0 0 6px rgba(255,90,90,.15)}
   .water{position:absolute;right:10px;bottom:10px;font-size:11px;padding:6px 8px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
-  .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none;white-space:pre-line}
+  .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;display:none;white-space:pre-line;border-radius:10px}
   .hint{font-size:12px;color:#a2acc4}
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
@@ -115,9 +115,10 @@
   // ---------- State ----------
   let stream=null, mediaRecorder=null, chunks=[];
   let timerIv=null;
+  let blazeModel=null;
 
   // ---------- Utils ----------
-  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display='block'; }
   function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
   function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
   function startTimer(){ const t0=Date.now(); if(timerIv) clearInterval(timerIv); timerIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-t0)/1000); },250); }
@@ -178,7 +179,7 @@
     };
   }
 
-  // ---------- Overlay guide (just a generous center box) ----------
+  // ---------- Overlay guide ----------
   function drawGuide(){
     requestAnimationFrame(drawGuide);
     if(!v || v.readyState<2) return;
@@ -190,7 +191,7 @@
     cx.strokeRect(gx,gy,gw,gh);
   }
 
-  // ---------- Lazy-load TFJS + BlazeFace only when analyzing ----------
+  // ---------- Lazy-load TFJS+BlazeFace (fallback only) ----------
   function loadScript(src){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script');
@@ -198,7 +199,7 @@
       document.head.appendChild(s);
     });
   }
-  async function ensureModel(){
+  async function ensureBlaze(){
     if(window.__blazeModel) return window.__blazeModel;
     if(!window.tf) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js');
     if(!window.blazeface) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js');
@@ -207,18 +208,40 @@
     return window.__blazeModel;
   }
 
-  // ---------- Super-lenient “facing forward” rule ----------
-  // A frame counts as 'forward' if:
-  //  - a face is detected (probability >= 0.6), and
-  //  - the face bbox covers at least 1.2% of the frame area (so the face is visible).
-  function isForward(face, W, H){
-    const prob = Array.isArray(face.probability) ? face.probability[0] : (face.probability||0.0);
-    const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
-    const areaRatio = ((x2-x1)*(y2-y1))/(W*H);
-    return (prob >= 0.6) && (areaRatio >= 0.012);
+  // ---------- Primary detector: FaceDetector API ----------
+  async function detectWithFaceDetector(canvas){
+    if(!('FaceDetector' in window)) return null;
+    try{
+      if(!window.__fd) window.__fd = new FaceDetector({fastMode:true, maxDetectedFaces:1});
+      // Some implementations prefer ImageBitmap
+      try {
+        return await window.__fd.detect(canvas);
+      } catch(_) {
+        const bmp = await createImageBitmap(canvas);
+        const res = await window.__fd.detect(bmp);
+        if(bmp.close) bmp.close();
+        return res;
+      }
+    }catch(e){
+      console.warn('FaceDetector failed:', e);
+      return null;
+    }
   }
 
-  // Some browsers report Infinity duration for fresh blobs; nudge it to resolve.
+  // ---------- Super-lenient “forward” rule ----------
+  function isForwardBox(box, W, H){
+    // Accept if face box covers ≥0.8% of frame (very lenient).
+    const areaRatio = (box.width*box.height)/(W*H);
+    return areaRatio >= 0.008;
+  }
+  function isForwardBlaze(pred, W, H){
+    const [x1,y1]=pred.topLeft, [x2,y2]=pred.bottomRight;
+    const prob = Array.isArray(pred.probability) ? pred.probability[0] : (pred.probability||0.0);
+    const areaRatio = ((x2-x1)*(y2-y1))/(W*H);
+    return (prob >= 0.5) && (areaRatio >= 0.008);
+  }
+
+  // ---------- Duration fix for WebM blobs ----------
   function loadVideoForAnalysis(src){
     return new Promise((resolve, reject)=>{
       const av=document.createElement('video');
@@ -243,51 +266,58 @@
   // ---------- Analyzer ----------
   async function analyze(videoURL){
     if(!videoURL) throw new Error('No video to analyze.');
-    const model = await ensureModel();
     const av = await loadVideoForAnalysis(videoURL);
 
-    // Downscale to help detection and keep ratios consistent
+    // Downscale for speed
     const fullW = av.videoWidth || 1280, fullH = av.videoHeight || 720;
-    const smallW = Math.min(640, fullW);
-    const smallH = Math.round(fullH * (smallW/fullW));
-    const off = document.createElement('canvas'); off.width=smallW; off.height=smallH;
+    const W = Math.min(640, fullW);
+    const H = Math.round(fullH * (W/fullW));
+    const off = document.createElement('canvas'); off.width=W; off.height=H;
     const ox = off.getContext('2d');
 
     const duration = av.duration;
-    const fps = 4;                             // 4 fps sampling
+    const fps = 4;
     const steps = Math.max(1, Math.floor(duration * fps));
-    let total=0, facing=0;
+    let total=0, forward=0;
+
+    // Prepare fallback model only if we actually need it
+    let blaze=null;
 
     for(let i=0;i<steps;i++){
       const t = Math.min(duration - 0.05, i/fps);
       await new Promise((resolve)=>{ const onSeek=()=>{ av.removeEventListener('seeked',onSeek); resolve(); }; av.addEventListener('seeked',onSeek); av.currentTime=t; });
 
-      ox.drawImage(av, 0, 0, smallW, smallH);
+      ox.drawImage(av, 0, 0, W, H);
 
-      let preds = await model.estimateFaces(off, false);
-      // If nothing found, try a second pass with horizontally flipped input (rare cam drivers)
-      if(!preds || !preds.length){
-        // flip to temp canvas
-        const tmp = document.createElement('canvas'); tmp.width=smallW; tmp.height=smallH;
-        const tx = tmp.getContext('2d'); tx.translate(smallW,0); tx.scale(-1,1); tx.drawImage(off,0,0);
-        preds = await model.estimateFaces(tmp, false);
+      // 1) Try FaceDetector (Chrome)
+      let counted = false;
+      const fdRes = await detectWithFaceDetector(off);
+      if(Array.isArray(fdRes) && fdRes.length){
+        // take the biggest box
+        const box = fdRes.reduce((a,b)=> (a.boundingBox?.width*a.boundingBox?.height > b.boundingBox?.width*b.boundingBox?.height ? a : b)).boundingBox;
+        if(box && isForwardBox(box, W, H)) { forward++; counted = true; }
+      }
+
+      // 2) Fallback: BlazeFace
+      if(!counted){
+        if(!blaze) blaze = await ensureBlaze();
+        let preds = await blaze.estimateFaces(off, false);
+        if((preds && preds.length) || (preds = [])){
+          // choose strongest
+          const best = preds.reduce((a,b)=> ((a.probability?.[0]||0)>(b.probability?.[0]||0)?a:b), preds[0]);
+          if(best && isForwardBlaze(best, W, H)) { forward++; }
+        }
       }
 
       total++;
-      if(preds && preds.length>=1){
-        // accept the strongest face
-        const face = preds.reduce((a,b)=> ((a.probability?.[0]||0)>(b.probability?.[0]||0)?a:b));
-        if(isForward(face, smallW, smallH)) facing++;
-      }
-
       const pct = Math.round((i+1)/steps*100);
       progBar.style.width = pct + '%'; progText.textContent = pct + '%';
     }
 
-    const percent = total ? Math.round((facing/total)*100) : 0;
+    const percent = total ? Math.round((forward/total)*100) : 0;
     scoreEl.textContent = percent + '%';
     scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
-    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${fps} fps)`;
+    scoreDetail.textContent = `${forward} of ${total} sampled frames (~${fps} fps)`;
   }
 
   // ---------- Handlers ----------
