@@ -237,4 +237,134 @@
       blazeModel = await blazeface.load(); // loads from stable tfjs-models host
     }
 
-    const av = document.createElement(
+    const av = document.createElement('video');
+    av.src = videoURL;
+    av.crossOrigin = 'anonymous';
+    av.muted = true;
+    av.playsInline = true;
+    await new Promise(res=> av.onloadedmetadata=res);
+    const duration = av.duration || 0;
+    if(!duration || !isFinite(duration)) throw new Error('Could not read video duration.');
+
+    const W = pb.videoWidth || 1280, H = pb.videoHeight || 720;
+    const off = document.createElement('canvas'); off.width=W; off.height=H;
+    const ox = off.getContext('2d');
+
+    const targetFPS = 4, step = 1/targetFPS;
+    let total=0, facing=0;
+
+    for(let t=0; t<duration; t+=step){
+      await new Promise((resolve)=>{
+        const onSeek = ()=>{ av.removeEventListener('seeked', onSeek); resolve(); };
+        av.addEventListener('seeked', onSeek);
+        av.currentTime = Math.min(t, duration - 0.05);
+      });
+
+      ox.drawImage(av, 0, 0, W, H);
+
+      const preds = await blazeModel.estimateFaces(off, false);
+      total++;
+      if(preds && preds.length===1){
+        if(facingHeuristic(preds[0], W, H)) facing++;
+      }
+
+      const pct = Math.round(Math.min(100, (t/duration)*100));
+      progBar.style.width = pct + '%';
+      progText.textContent = pct + '%';
+    }
+    progBar.style.width = '100%';
+    progText.textContent = '100%';
+
+    const percent = total ? Math.round((facing/total)*100) : 0;
+    scoreEl.textContent = percent + '%';
+    scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
+    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
+  }
+
+  // ---------- Handlers ----------
+  enableBtn.addEventListener('click', async ()=>{
+    clearErr();
+    try{
+      const got = await requestPermissionsRobust();  // prompt on click
+      await listDevices();                           // labels appear after permission
+      await startStream(!!got.audio);                // start with/without mic
+      perm.textContent='Permissions: granted';
+      enableBtn.disabled=true;
+      startBtn.disabled=false;
+    }catch(e){
+      console.error(e);
+      perm.textContent='Permissions: denied';
+      let msg = 'Unable to access camera/microphone.\n\n';
+      if(e && e.name==='NotAllowedError'){
+        msg += 'Access was blocked.\nChrome: click the lock icon → Site settings → set Camera & Microphone to Allow for cambridgexr.github.io → refresh.';
+      } else if(e && e.name==='NotFoundError'){
+        msg += 'No camera/microphone found. Connect a device and try again.';
+      } else if(e && e.name==='NotReadableError'){
+        msg += 'Your camera/mic is in use by another app. Close it and retry.';
+      } else if(e && e.name==='OverconstrainedError'){
+        msg += 'Selected device is not available. Choose another camera/mic.';
+      } else if(e && e.name==='SecurityError'){
+        msg += 'Needs HTTPS/top-level context (GitHub Pages is OK).';
+      } else {
+        msg += (e && e.message) ? e.message : String(e);
+      }
+      showErr(msg);
+      hint.style.display='block';
+      hint.textContent='Windows tip: Settings → Privacy & security → Camera/Microphone → allow access for browsers.';
+    }
+  });
+
+  camSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ try{ await startStream(false); }catch(_){}} });
+  micSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ hint.style.display='block'; hint.textContent='That microphone failed; continuing with camera-only.'; await startStream(false); } });
+
+  startBtn.addEventListener('click', ()=>{
+    if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
+    setupRecorder();
+    mediaRecorder.start();
+    recording=true; paused=false;
+    startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
+    startTimer();
+  });
+
+  pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; pauseBtn.disabled=true; resumeBtn.disabled=false; }});
+  resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); paused=false; pauseBtn.disabled=false; resumeBtn.disabled=true; }});
+  stopBtn.addEventListener('click', ()=>{
+    if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
+      mediaRecorder.stop(); recording=false; paused=false;
+      stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false;
+      stopTimer();
+    }
+  });
+
+  analyzeBtn.addEventListener('click', async ()=>{
+    try{
+      analyzeBtn.disabled = true;
+      progBar.style.width = '0%';
+      progText.textContent = '0%';
+      scoreEl.textContent = '—%';
+      scoreDetail.textContent = 'analyzing…';
+      await analyzeEyeContact(pb.src);
+      analyzeBtn.disabled = false;
+    }catch(e){
+      console.error(e);
+      analyzeBtn.disabled = false;
+      showErr('Analysis failed: ' + (e && e.message ? e.message : e));
+    }
+  });
+
+  pb.addEventListener('loadeddata', ()=>{ if(pb.src) analyzeBtn.disabled=false; });
+
+  // Early checks
+  (function(){
+    if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
+      perm.textContent='Unsupported browser';
+      showErr('Your browser does not support camera/microphone (no navigator.mediaDevices.getUserMedia). Use latest Chrome/Edge/Firefox.');
+    }
+    if(typeof MediaRecorder==='undefined'){
+      showErr('Recording is not supported in this browser.');
+    }
+  })();
+})();
+</script>
+</body>
+</html>
