@@ -31,6 +31,10 @@
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
+
+<!-- Stable UMD builds (no ES modules) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -86,261 +90,276 @@
   </div>
 </div>
 
-<!-- All logic uses ES modules so libs are guaranteed to be loaded -->
-<script type="module">
-import * as tf from 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.14.0/dist/tf-core.esm.js';
-import 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.14.0/dist/tf-converter.esm.js';
-import 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.14.0/dist/tf-backend-webgl.esm.js';
-import * as faceLandmarksDetection from 'https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.3/dist/face-landmarks-detection.esm.js';
+<script>
+(() => {
+  // ---------- Elements ----------
+  const v = document.getElementById('preview');
+  const pb = document.getElementById('playback');
+  const cv = document.getElementById('overlay');
+  const cx = cv.getContext('2d');
+  const camSel = document.getElementById('camera');
+  const micSel = document.getElementById('microphone');
+  const perm = document.getElementById('perm');
+  const enableBtn = document.getElementById('enable');
+  const startBtn = document.getElementById('start');
+  const pauseBtn = document.getElementById('pause');
+  const resumeBtn = document.getElementById('resume');
+  const stopBtn = document.getElementById('stop');
+  const downloadLink = document.getElementById('download');
+  const timerEl = document.getElementById('timer');
+  const errBox = document.getElementById('err');
+  const hint = document.getElementById('hint');
+  const liveDot = document.getElementById('liveDot');
+  const analyzeBtn = document.getElementById('analyze');
+  const progBar = document.getElementById('prog');
+  const progText = document.getElementById('progText');
+  const scoreEl = document.getElementById('score');
+  const scoreDetail = document.getElementById('scoreDetail');
 
-const $ = sel => document.getElementById(sel);
-const v = $('preview'), pb = $('playback'), cv = $('overlay'), cx = cv.getContext('2d');
-const camSel = $('camera'), micSel = $('microphone'), perm = $('perm');
-const enableBtn = $('enable'), startBtn = $('start'), pauseBtn = $('pause'), resumeBtn = $('resume'), stopBtn = $('stop');
-const downloadLink = $('download'), timerEl = $('timer'), errBox = $('err'), hint = $('hint'), liveDot=$('liveDot');
-const analyzeBtn = $('analyze'), progBar=$('prog'), progText=$('progText'), scoreEl=$('score'), scoreDetail=$('scoreDetail');
+  // ---------- State ----------
+  let stream=null, mediaRecorder=null, chunks=[];
+  let tIv=null;
+  let blazeModel=null;
 
-let stream=null, mediaRecorder=null, chunks=[];
-let tIv=null, flModel=null;
+  // ---------- Utils ----------
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
+  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
+  function startTimer(){ const t0=Date.now(); if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-t0)/1000); },250); }
+  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
+  function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
 
-function showErr(msg){ errBox.textContent=msg; errBox.style.display='block'; }
-function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
-function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
-function startTimer(){ const t0=Date.now(); if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ const s=(Date.now()-t0)/1000; timerEl.textContent=fmt(s); },250); }
-function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
-function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
+  // ---------- Devices & stream ----------
+  async function listDevices(){
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d=>d.kind==='videoinput');
+    const mics = devs.filter(d=>d.kind==='audioinput');
+    camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
+    micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
+  }
 
-async function listDevices(){
-  const devs = await navigator.mediaDevices.enumerateDevices();
-  const cams = devs.filter(d=>d.kind==='videoinput');
-  const mics = devs.filter(d=>d.kind==='audioinput');
-  camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
-  micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
-}
-
-async function requestPermissionsRobust(){
-  perm.textContent='Permissions: requesting…';
-  try{
-    const pre = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
-    pre.getTracks().forEach(t=>t.stop());
-    return {video:true,audio:true};
-  }catch(e1){
+  async function requestPermissionsRobust(){
+    perm.textContent='Permissions: requesting…';
     try{
-      const pre2 = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
-      pre2.getTracks().forEach(t=>t.stop());
-      hint.style.display='block';
-      hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
-      return {video:true,audio:false};
-    }catch(e2){ throw e1; }
-  }
-}
-
-async function startStream(wantAudio=true){
-  if(stream) stream.getTracks().forEach(t=>t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({
-    video:{ deviceId: camSel.value?{exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
-    audio: wantAudio ? { deviceId: micSel.value?{exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true } : false
-  });
-  v.srcObject=stream; v.muted=true; await v.play();
-  liveDot.classList.add('live');
-  setCanvasSize();
-  drawGuide();
-}
-
-function setupRecorder(){
-  chunks.length=0;
-  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-               MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
-  mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
-  mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
-  mediaRecorder.onstop = ()=>{
-    const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
-    const url = URL.createObjectURL(blob);
-    pb.src = url;
-    downloadLink.href = url; downloadLink.style.display='inline-flex';
-    downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
-    analyzeBtn.disabled = false;
-  };
-}
-
-function drawGuide(){
-  requestAnimationFrame(drawGuide);
-  if(!v || v.readyState<2) return;
-  setCanvasSize();
-  const W=cv.width,H=cv.height;
-  cx.clearRect(0,0,W,H);
-  // generous center window for facing-forward detection aid
-  cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
-  const gx=W*0.20, gy=H*0.20, gw=W*0.60, gh=H*0.60;
-  cx.strokeRect(gx,gy,gw,gh);
-}
-
-// ----- Face model -----
-async function ensureFaceModel(){
-  if(flModel) return;
-  await tf.setBackend('webgl'); await tf.ready();
-  flModel = await faceLandmarksDetection.load(
-    faceLandmarksDetection.SupportedPackages.mediapipeFacemesh,
-    { maxFaces:1, shouldLoadIrisModel:false }
-  );
-}
-
-// ----- Forward-facing heuristic (pose-only) -----
-function bboxFromPoints(points){
-  if(!points?.length) return null;
-  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-  for(const p of points){ const x=p[0],y=p[1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
-  return {x:minX,y:minY,w:maxX-minX,h:maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
-}
-function avgPoint(arr){ if(!arr?.length) return null; let x=0,y=0; for(const p of arr){ x+=p[0]; y+=p[1]; } return [x/arr.length,y/arr.length]; }
-
-function forwardFacing(ann, frameW, frameH){
-  const facePts = [].concat(ann.silhouette||[], ann.leftCheek||[], ann.rightCheek||[], ann.midwayBetweenEyes||[], ann.noseTip||[]);
-  const fb = bboxFromPoints(facePts); if(!fb) return false;
-
-  // generous framing (aim for 100% when straight-on)
-  const centerOk = (fb.cx > frameW*0.20 && fb.cx < frameW*0.80 && fb.cy > frameH*0.18 && fb.cy < frameH*0.82);
-  const sizeOk   = (fb.w*fb.h)/(frameW*frameH) > 0.020;
-
-  const LU = ann.leftEyeUpper0||[], RU = ann.rightEyeUpper0||[], LL = ann.leftEyeLower0||[], RL = ann.rightEyeLower0||[];
-  if(!LU.length || !RU.length) return false;
-  const Lc = avgPoint(LU.concat(LL)), Rc = avgPoint(RU.concat(RL)); if(!Lc||!Rc) return false;
-
-  // Roll/Pitch proxy: eyes roughly level
-  const eyeDx = Math.hypot(Rc[0]-Lc[0], Rc[1]-Lc[1]) || 1;
-  const eyesLevel = Math.abs((Rc[1]-Lc[1]))/eyeDx < 0.22; // lenient
-
-  // Yaw proxy: nose centered between “ears” (fallback to silhouette extremes)
-  let leftRef = ann.leftEarTragion?.[0], rightRef = ann.rightEarTragion?.[0];
-  if(!leftRef || !rightRef){
-    if(ann.silhouette?.length){
-      leftRef  = ann.silhouette.reduce((a,b)=> b[0]<a[0]?b:a);
-      rightRef = ann.silhouette.reduce((a,b)=> b[0]>a[0]?b:a);
-    } else { leftRef=[fb.x,fb.cy]; rightRef=[fb.x+fb.w,fb.cy]; }
-  }
-  const nose = ann.noseTip?.[0] || avgPoint(ann.noseBottom||ann.noseBridge||[[fb.cx,fb.cy]]);
-  const dNL = Math.hypot(nose[0]-leftRef[0], nose[1]-leftRef[1]);
-  const dNR = Math.hypot(nose[0]-rightRef[0], nose[1]-rightRef[1]);
-  const yawSkew = Math.abs(dNL-dNR) / ((dNL+dNR)/2 || 1);
-  const yawOk = yawSkew < 0.40; // lenient
-
-  return centerOk && sizeOk && eyesLevel && yawOk;
-}
-
-// ----- Analyzer -----
-function loadVideoForAnalysis(src){
-  return new Promise((resolve,reject)=>{
-    const av=document.createElement('video');
-    av.preload='auto'; av.muted=true; av.playsInline=true; av.src=src;
-    function finish(){
-      if(!isFinite(av.duration) || av.duration<=0) reject(new Error('Could not read video duration.'));
-      else resolve(av);
-    }
-    av.addEventListener('loadedmetadata', ()=>{
-      if(isFinite(av.duration) && av.duration>0 && av.duration!==Infinity){ finish(); }
-      else {
-        const onTimeUpdate=()=>{ av.removeEventListener('timeupdate',onTimeUpdate); av.currentTime=0; setTimeout(finish,0); };
-        av.addEventListener('timeupdate', onTimeUpdate);
-        try{ av.currentTime=1e101; }catch(_){}
-        try{ av.play().then(()=>{ av.pause(); }).catch(()=>{});}catch(_){}
+      const pre = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+      pre.getTracks().forEach(t=>t.stop());
+      return {video:true,audio:true};
+    }catch(e1){
+      try{
+        const pre2 = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+        pre2.getTracks().forEach(t=>t.stop());
+        hint.style.display='block';
+        hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
+        return {video:true,audio:false};
+      }catch(e2){
+        throw e1;
       }
-    }, {once:true});
-    av.addEventListener('error', ()=>reject(new Error('Video could not be loaded.')), {once:true});
-  });
-}
+    }
+  }
 
-async function analyzeEyeContact(videoURL){
-  if(!videoURL) throw new Error('No video to analyze.');
-  await ensureFaceModel();
+  async function startStream(wantAudio=true){
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{ deviceId: camSel.value?{exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+      audio: wantAudio ? { deviceId: micSel.value?{exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true } : false
+    });
+    v.srcObject=stream; v.muted=true; await v.play();
+    liveDot.classList.add('live');
+    setCanvasSize();
+    drawGuide();
+  }
 
-  const av = await loadVideoForAnalysis(videoURL);
-  const W = av.videoWidth || 1280, H = av.videoHeight || 720;
-  const off = document.createElement('canvas'); off.width=W; off.height=H; const ox = off.getContext('2d');
+  // ---------- Recorder ----------
+  function setupRecorder(){
+    chunks.length=0;
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
+                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':
+                 'video/webm';
+    mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
+    mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = ()=>{
+      const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
+      const url = URL.createObjectURL(blob);
+      pb.src = url;
+      downloadLink.href = url; downloadLink.style.display='inline-flex';
+      downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+      analyzeBtn.disabled = false;
+    };
+  }
 
-  const duration = av.duration;
-  const targetFPS = 6; // denser sampling
-  const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
-  let total=0, facing=0;
+  // ---------- Overlay guide ----------
+  function drawGuide(){
+    requestAnimationFrame(drawGuide);
+    if(!v || v.readyState<2) return;
+    setCanvasSize();
+    const W=cv.width, H=cv.height;
+    cx.clearRect(0,0,W,H);
+    cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
+    // generous acceptance window so straight-on reads ~100%
+    const gx=W*0.20, gy=H*0.20, gw=W*0.60, gh=H*0.60;
+    cx.strokeRect(gx,gy,gw,gh);
+  }
 
-  for(let i=0;i<totalSteps;i++){
-    const t = Math.min(duration - 0.05, (i/targetFPS));
-    await new Promise((resolve)=>{ const onSeek=()=>{ av.removeEventListener('seeked',onSeek); resolve(); }; av.addEventListener('seeked',onSeek); av.currentTime=t; });
-    ox.drawImage(av,0,0,W,H);
+  // ---------- Load face model (once) ----------
+  async function ensureBlaze(){
+    if(blazeModel) return;
+    await tf.setBackend('webgl'); await tf.ready();
+    blazeModel = await blazeface.load(); // loads from tfjs-models store
+  }
 
-    const preds = await flModel.estimateFaces({input: off, flipHorizontal:false, returnTensors:false, predictIrises:false});
-    total++;
-    if(Array.isArray(preds) && preds.length===1 && preds[0].annotations){
-      if(forwardFacing(preds[0].annotations, W, H)) facing++;
+  // ---------- Facing-forward heuristic (pose-only, lenient) ----------
+  function forwardFacingBlaze(face, W, H){
+    const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
+    const cx=(x1+x2)/2, cy=(y1+y2)/2;
+    const w=(x2-x1), h=(y2-y1);
+    const areaRatio=(w*h)/(W*H);
+
+    // framing (wide box so "clearly visible" reads as forward)
+    const centerOk = (cx > W*0.20 && cx < W*0.80 && cy > H*0.18 && cy < H*0.82);
+    const sizeOk   = areaRatio > 0.020;
+
+    // landmarks: [rightEye, leftEye, nose, mouth, rightEar, leftEar]
+    const lm = face.landmarks || [];
+    if(lm.length < 6) return centerOk && sizeOk; // fall back to framing only
+
+    const Reye=lm[0], Leye=lm[1], Nose=lm[2], Rear=lm[4], Lear=lm[5];
+
+    // Eyes roughly level (roll/pitch proxy)
+    const eyeDx = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
+    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDx < 0.22;  // lenient
+
+    // Yaw: nose distance to ears similar
+    const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
+    const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
+    const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
+    const yawOk = yawSkew < 0.40; // lenient
+
+    // Pitch: nose near eye-line (relative to face height)
+    const eyeMidY = (Leye[1]+Reye[1])/2;
+    const pitch = Math.abs(Nose[1]-eyeMidY) / (h || 1);
+    const pitchOk = pitch < 0.40; // lenient
+
+    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
+  }
+
+  // ---------- Duration fix ----------
+  function loadVideoForAnalysis(src){
+    return new Promise((resolve, reject)=>{
+      const av=document.createElement('video');
+      av.preload='auto'; av.muted=true; av.playsInline=true; av.src=src;
+      function finish(){
+        if(!isFinite(av.duration) || av.duration<=0) reject(new Error('Could not read video duration.'));
+        else resolve(av);
+      }
+      av.addEventListener('loadedmetadata', ()=>{
+        if(isFinite(av.duration) && av.duration>0 && av.duration!==Infinity){ finish(); }
+        else {
+          const onTimeUpdate=()=>{ av.removeEventListener('timeupdate', onTimeUpdate); av.currentTime=0; setTimeout(finish,0); };
+          av.addEventListener('timeupdate', onTimeUpdate);
+          try{ av.currentTime=1e101; }catch(_){}
+          try{ av.play().then(()=>{ av.pause(); }).catch(()=>{});}catch(_){}
+        }
+      }, {once:true});
+      av.addEventListener('error', ()=>reject(new Error('Video could not be loaded.')), {once:true});
+    });
+  }
+
+  // ---------- Analyzer (post-recording) ----------
+  async function analyzeEyeContact(videoURL){
+    if(!videoURL) throw new Error('No video to analyze.');
+    await ensureBlaze();
+
+    const av = await loadVideoForAnalysis(videoURL);
+    const W = av.videoWidth || 1280, H = av.videoHeight || 720;
+    const off = document.createElement('canvas'); off.width=W; off.height=H;
+    const ox = off.getContext('2d');
+
+    const duration = av.duration;
+    const targetFPS = 6; // dense sampling
+    const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
+    let total=0, facing=0;
+
+    for(let i=0;i<totalSteps;i++){
+      const t = Math.min(duration - 0.05, (i/targetFPS));
+      await new Promise((resolve)=>{ const onSeek=()=>{ av.removeEventListener('seeked',onSeek); resolve(); }; av.addEventListener('seeked',onSeek); av.currentTime=t; });
+
+      ox.drawImage(av, 0, 0, W, H);
+      const preds = await blazeModel.estimateFaces(off, false);
+      total++;
+      if(preds && preds.length===1){
+        if(forwardFacingBlaze(preds[0], W, H)) facing++;
+      }
+
+      const pct = Math.round((i+1)/totalSteps*100);
+      progBar.style.width = pct + '%'; progText.textContent = pct + '%';
     }
 
-    const pct = Math.round((i+1)/totalSteps*100);
-    progBar.style.width = pct+'%'; progText.textContent = pct+'%';
+    const percent = total ? Math.round((facing/total)*100) : 0;
+    scoreEl.textContent = percent + '%';
+    scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
+    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
   }
 
-  const percent = total ? Math.round((facing/total)*100) : 0;
-  scoreEl.textContent = percent + '%';
-  scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
-  scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
-}
+  // ---------- Handlers ----------
+  enableBtn.addEventListener('click', async ()=>{
+    clearErr();
+    try{
+      const got = await requestPermissionsRobust();
+      await listDevices();
+      await startStream(!!got.audio);
+      perm.textContent='Permissions: granted';
+      enableBtn.disabled=true; startBtn.disabled=false;
+    }catch(e){
+      console.error(e);
+      perm.textContent='Permissions: denied';
+      let msg='Unable to access camera/microphone.\n\n';
+      if(e?.name==='NotAllowedError'){ msg+='Access was blocked.\nChrome: lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.'; }
+      else if(e?.name==='NotFoundError'){ msg+='No camera/microphone found. Connect a device and try again.'; }
+      else if(e?.name==='NotReadableError'){ msg+='Your camera/mic is in use by another app. Close it and retry.'; }
+      else if(e?.name==='OverconstrainedError'){ msg+='Selected device not available. Choose another camera/mic.'; }
+      else { msg+= (e?.message) ? e.message : String(e); }
+      showErr(msg); hint.style.display='block';
+      hint.textContent='Windows tip: Settings → Privacy & security → Camera/Microphone → allow access for browsers.';
+    }
+  });
 
-// ----- Handlers -----
-enableBtn.addEventListener('click', async ()=>{
-  clearErr();
-  try{
-    const got = await requestPermissionsRobust();
-    await listDevices();
-    await startStream(!!got.audio);
-    perm.textContent='Permissions: granted';
-    enableBtn.disabled=true; startBtn.disabled=false;
-  }catch(e){
-    console.error(e);
-    perm.textContent='Permissions: denied';
-    let msg='Unable to access camera/microphone.\n\n';
-    if(e?.name==='NotAllowedError'){ msg+='Access was blocked.\nChrome: lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.'; }
-    else if(e?.name==='NotFoundError'){ msg+='No camera/microphone found. Connect a device and try again.'; }
-    else if(e?.name==='NotReadableError'){ msg+='Your camera/mic is in use by another app. Close it and retry.'; }
-    else if(e?.name==='OverconstrainedError'){ msg+='Selected device not available. Choose another camera/mic.'; }
-    else { msg+= (e?.message) ? e.message : String(e); }
-    showErr(msg); hint.style.display='block'; hint.textContent='Windows tip: Settings → Privacy & security → Camera/Microphone → allow access for browsers.';
-  }
-});
+  camSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ try{ await startStream(false); }catch(_){}} });
+  micSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ hint.style.display='block'; hint.textContent='That microphone failed; continuing with camera-only.'; await startStream(false); } });
 
-camSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ try{ await startStream(false); }catch(_){}} });
-micSel.addEventListener('change', async ()=>{ try{ await startStream(true); }catch(e){ hint.style.display='block'; hint.textContent='That microphone failed; continuing with camera-only.'; await startStream(false); } });
+  startBtn.addEventListener('click', ()=>{
+    if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
+    chunks.length=0; setupRecorder(); mediaRecorder.start();
+    startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true; startTimer();
+  });
 
-startBtn.addEventListener('click', ()=>{
-  if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
-  chunks.length=0; setupRecorder(); mediaRecorder.start();
-  startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true; startTimer();
-});
+  pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); pauseBtn.disabled=true; resumeBtn.disabled=false; }});
+  resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); pauseBtn.disabled=false; resumeBtn.disabled=true; }});
+  stopBtn.addEventListener('click', ()=>{
+    if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
+      mediaRecorder.stop(); stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false; stopTimer();
+    }
+  });
 
-pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); pauseBtn.disabled=true; resumeBtn.disabled=false; }});
-resumeBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='paused'){ mediaRecorder.resume(); pauseBtn.disabled=false; resumeBtn.disabled=true; }});
-stopBtn.addEventListener('click', ()=>{
-  if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
-    mediaRecorder.stop(); stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false; stopTimer();
-  }
-});
+  pb.addEventListener('loadeddata', ()=>{ if(pb.src) analyzeBtn.disabled=false; });
+  analyzeBtn.addEventListener('click', async ()=>{
+    clearErr();
+    try{
+      analyzeBtn.disabled=true; progBar.style.width='0%'; progText.textContent='0%'; scoreEl.textContent='—%'; scoreDetail.textContent='analyzing…';
+      await analyzeEyeContact(pb.src);
+    }catch(e){ console.error(e); showErr('Analysis failed: ' + (e?.message || e)); }
+    finally{ analyzeBtn.disabled=false; }
+  });
 
-$('playback').addEventListener('loadeddata', ()=>{ if(pb.src) analyzeBtn.disabled=false; });
-analyzeBtn.addEventListener('click', async ()=>{
-  clearErr();
-  try{
-    analyzeBtn.disabled=true; progBar.style.width='0%'; progText.textContent='0%'; scoreEl.textContent='—%'; scoreDetail.textContent='analyzing…';
-    await analyzeEyeContact(pb.src);
-  }catch(e){ console.error(e); showErr('Analysis failed: ' + (e?.message || e)); }
-  finally{ analyzeBtn.disabled=false; }
-});
-
-// Early checks
-(function(){
-  if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
-    perm.textContent='Unsupported browser';
-    showErr('Your browser does not support camera/microphone (no navigator.mediaDevices.getUserMedia). Use latest Chrome/Edge/Firefox.');
-  }
-  if(typeof MediaRecorder==='undefined'){
-    showErr('Recording is not supported in this browser.');
-  }
+  // Early checks
+  (function(){
+    if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
+      perm.textContent='Unsupported browser';
+      showErr('Your browser does not support camera/microphone (no navigator.mediaDevices.getUserMedia). Use latest Chrome/Edge/Firefox.');
+    }
+    if(typeof MediaRecorder==='undefined'){
+      showErr('Recording is not supported in this browser.');
+    }
+  })();
 })();
 </script>
 </body>
