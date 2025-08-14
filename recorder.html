@@ -29,7 +29,7 @@
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#7683a8}
   .dot.live{background:#ff5a5a;box-shadow:0 0 0 6px rgba(255,90,90,.15)}
   .water{position:absolute;right:10px;bottom:10px;font-size:11px;padding:6px 8px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
-  .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none}
+  .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none;white-space:pre-line}
   .hint{font-size:12px;color:var(--muted)}
 </style>
 </head>
@@ -43,14 +43,16 @@
         <canvas id="overlay"></canvas>
         <div class="water"><span id="liveDot" class="dot"></span> Live</div>
       </div>
+
       <div class="bar">
         <select id="camera"></select>
         <select id="microphone"></select>
         <label class="pill"><input type="checkbox" id="mirror"> Mirror</label>
         <div class="pill">Mic level <span class="meter"><span id="vu"></span></span></div>
         <span class="tag" id="perm">Permissions: not requested</span>
-        <a id="openTab" class="btn" href="#" style="display:none">Open recorder in a new tab</a>
+        <span class="tag" id="permState" style="display:none"></span>
       </div>
+
       <div class="bar">
         <button id="enable" class="primary">Enable camera & mic</button>
         <button id="start" disabled>Start</button>
@@ -60,6 +62,7 @@
         <a id="download" class="btn" download="practice.webm" style="display:none">Download</a>
         <span class="tag" id="timer">00:00</span>
       </div>
+
       <div id="err" class="err"></div>
       <div class="hint" id="hint" style="margin-top:6px;display:none"></div>
     </div>
@@ -93,6 +96,7 @@
   const micSel = document.getElementById('microphone');
   const mirror = document.getElementById('mirror');
   const perm = document.getElementById('perm');
+  const permState = document.getElementById('permState');
   const enableBtn = document.getElementById('enable');
   const startBtn = document.getElementById('start');
   const pauseBtn = document.getElementById('pause');
@@ -105,7 +109,6 @@
   const vu = document.getElementById('vu');
   const liveDot = document.getElementById('liveDot');
   const errBox = document.getElementById('err');
-  const openTab = document.getElementById('openTab');
   const hint = document.getElementById('hint');
 
   let stream=null, mediaRecorder=null, chunks=[];
@@ -117,48 +120,56 @@
   function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
   function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
 
-  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return \`\${m}:\${x}\`; }
+  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
+  let tIv=null, tStart=0;
+  function startTimer(){ tStart=Date.now(); timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
+  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
 
-  function setCanvasSize(){
-    const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight;
-    if(w&&h){ cv.width=w; cv.height=h; }
+  function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
+
+  // ---- Permissions state (for debugging) ----
+  async function updatePermStates() {
+    if (!('permissions' in navigator)) return;
+    try {
+      const results = [];
+      for (const name of ['camera','microphone']) {
+        try {
+          const st = await navigator.permissions.query({ name });
+          results.push(`${name}:${st.state}`);
+        } catch {}
+      }
+      if (results.length) {
+        permState.style.display='inline-block';
+        permState.textContent = results.join(' | ');
+      }
+    } catch {}
   }
 
   async function listDevices(){
     const devs = await navigator.mediaDevices.enumerateDevices();
     const cams = devs.filter(d=>d.kind==='videoinput');
     const mics = devs.filter(d=>d.kind==='audioinput');
-    camSel.innerHTML = cams.map(d=>\`<option value="\${d.deviceId}">\${d.label||'Camera'}</option>\`).join('') || '<option>No camera</option>';
-    micSel.innerHTML = mics.map(d=>\`<option value="\${d.deviceId}">\${d.label||'Microphone'}</option>\`).join('') || '<option>No mic</option>';
+    camSel.innerHTML = cams.map(d=>`<option value="${d.deviceId}">${d.label||'Camera'}</option>`).join('') || '<option>No camera</option>';
+    micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
   }
 
-  // Show an "open in new tab" plan if embedded policies block us
-  function showNewTabFallback(message){
-    openTab.href = window.location.href;
-    openTab.target = '_blank';
-    openTab.rel = 'noopener';
-    openTab.style.display = 'inline-flex';
-    hint.textContent = message;
-    hint.style.display = 'block';
-  }
-
-  // Step 1: user-gesture permission preflight (Chrome requires a click)
   async function requestPermissions() {
+    // Show immediate feedback that we ARE requesting
+    perm.textContent = 'Permissions: requesting…';
+    // Force prompt (user gesture) for both devices
     const pre = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     pre.getTracks().forEach(t => t.stop());
   }
 
-  // Step 2: open the real stream (after permissions granted)
   async function startStream(){
     if(stream) stream.getTracks().forEach(t=>t.stop());
     stream = await navigator.mediaDevices.getUserMedia({
       video: { deviceId: camSel.value? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
       audio: { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
     });
-    v.srcObject = stream; await v.play();
+    v.srcObject = stream; v.muted = true; await v.play();
     liveDot.classList.add('live');
     setCanvasSize();
-
     // VU meter
     const AC = window.AudioContext || window.webkitAudioContext;
     const ac = new AC();
@@ -180,11 +191,11 @@
       const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
       const url = URL.createObjectURL(blob);
       pb.src = url; downloadLink.href = url; downloadLink.style.display='inline-flex';
-      downloadLink.download = \`presentation-\${new Date().toISOString().replace(/[:.]/g,'-')}.webm\`;
+      downloadLink.download = `presentation-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
       const pct = samples? Math.round((facingSamples/samples)*100): 0;
       scoreEl.textContent = pct + '%';
       scoreEl.style.color = pct>=70? 'var(--ok)' : pct>=40? 'var(--warn)' : 'var(--bad)';
-      scoreDetail.textContent = \`\${facingSamples} of \${samples} frames\`;
+      scoreDetail.textContent = `${facingSamples} of ${samples} frames`;
     };
   }
 
@@ -217,13 +228,13 @@
       if(!faceDetector){ try{ faceDetector = new FaceDetector({fastMode:true, maxDetectedFaces:2}); }catch(e){} }
       if(faceDetector){
         faceDetector.detect(v).then(faces=>{
-          drawDetections(faces);
           const now = performance.now();
           if(recording && !paused && (now - lastSampleTs) > (1000/sampleFPS)){
             lastSampleTs = now;
             samples++;
             if(faces.length===1 && isFacingCamera(faces[0], cv.width, cv.height)) facingSamples++;
           }
+          drawDetections(faces);
         }).catch(()=>{});
       }
     }
@@ -234,30 +245,33 @@
   enableBtn.addEventListener('click', async ()=>{
     clearErr();
     try{
-      await requestPermissions(); // prompts on user gesture
-      await listDevices();        // show device labels
-      await startStream();        // real stream
+      await requestPermissions();     // should ALWAYS cause a prompt on click
+      await updatePermStates();       // show Prompt/Granted/Denied if available
+      await listDevices();            // now labels appear
+      await startStream();            // actual stream
       perm.textContent='Permissions: granted';
       enableBtn.disabled=true;
       startBtn.disabled=false;
       loop();
     }catch(e){
       console.error(e);
+      await updatePermStates();
       perm.textContent='Permissions: denied';
-      let msg = 'Unable to access camera/microphone.';
+      let msg = 'Unable to access camera/microphone.\n\n';
       if(e && e.name==='NotAllowedError'){
-        msg = 'Access was blocked. In Chrome: click the lock icon → Site settings → Allow Camera & Microphone, then refresh.';
+        msg += 'Access was blocked.\nChrome → click the lock icon (left of the address bar) → Site settings → set Camera & Microphone to Allow for cambridgexr.github.io → refresh.';
       } else if(e && e.name==='NotFoundError'){
-        msg = 'No camera/microphone found. Connect a device and try again.';
+        msg += 'No camera/microphone found. Connect a device and try again.';
       } else if(e && e.name==='NotReadableError'){
-        msg = 'Your camera/mic is in use by another app. Close it and retry.';
+        msg += 'Your camera/mic is in use by another app. Close it and retry.';
       } else if(e && e.name==='SecurityError'){
-        msg = 'Needs HTTPS. Open over https://';
+        msg += 'Needs HTTPS or top-level context.';
+      } else {
+        msg += (e && e.message) ? e.message : String(e);
       }
       showErr(msg);
-
-      // If we’re inside an embed that blocks permissions, show the new-tab plan
-      try { if (window.top !== window.self) { showNewTabFallback('If this is embedded on a site that blocks camera/mic, click “Open recorder in a new tab”.'); } } catch(_){}
+      hint.style.display='block';
+      hint.textContent='Tip: You can also reset permissions in Chrome → site settings for cambridgexr.github.io.';
     }
   });
 
@@ -266,14 +280,10 @@
 
   startBtn.addEventListener('click', ()=>{
     if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
-    setupRecorder(); samples=0; facingSamples=0;
-    mediaRecorder.start(); recording=true; paused=false;
+    chunks.length=0; samples=0; facingSamples=0;
+    setupRecorder(); mediaRecorder.start(); recording=true; paused=false;
     startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
-
-    // simple timer
-    const f = s => String(Math.floor(s/60)).padStart(2,'0')+':'+String(Math.floor(s%60)).padStart(2,'0');
-    const t0 = Date.now(); timerEl.textContent='00:00';
-    const id = setInterval(()=>{ timerEl.textContent=f((Date.now()-t0)/1000); if(!recording) clearInterval(id); }, 250);
+    startTimer();
   });
 
   pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; pauseBtn.disabled=true; resumeBtn.disabled=false; }});
@@ -282,16 +292,21 @@
     if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
       mediaRecorder.stop(); recording=false; paused=false;
       stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false;
+      stopTimer();
     }
   });
 
-  // Support checks
-  if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
-    perm.textContent='Unsupported browser'; showErr('Your browser does not support camera/microphone.');
-  }
-  if(typeof MediaRecorder==='undefined'){
-    showErr('Recording is not supported in this browser.');
-  }
+  // Support checks (surface early)
+  (function initialChecks(){
+    if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
+      perm.textContent='Unsupported browser';
+      showErr('Your browser does not support camera/microphone (missing navigator.mediaDevices.getUserMedia). Try the latest Chrome/Edge/Firefox.');
+    }
+    if(typeof MediaRecorder==='undefined'){
+      showErr('Recording is not supported in this browser.');
+    }
+    updatePermStates();
+  })();
 })();
 </script>
 </body>
