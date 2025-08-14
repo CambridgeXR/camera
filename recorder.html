@@ -27,7 +27,7 @@
   .dot.live{background:#ff5a5a;box-shadow:0 0 0 6px rgba(255,90,90,.15)}
   .water{position:absolute;right:10px;bottom:10px;font-size:11px;padding:6px 8px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
   .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none;white-space:pre-line}
-  .hint{font-size:12px;color:var(--muted)}
+  .hint{font-size:12px;color:#a2acc4}
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
@@ -84,7 +84,7 @@
         </div>
       </div>
       <div class="hint">
-        Eye Contact % is computed after recording by sampling frames when one face is centered and roughly front-facing (on-device; no upload).
+        Eye Contact % is computed after recording by sampling frames when one face is roughly front-facing (your data is not shared with anyone).
       </div>
     </div>
   </div>
@@ -120,8 +120,8 @@
   // ---------- State ----------
   let stream=null, mediaRecorder=null, chunks=[];
   let recording=false, paused=false;
-  let tIv=null, tStart=0;
   let blazeModel=null;
+  let tIv=null, tStart=0;
 
   // ---------- Utils ----------
   function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
@@ -140,7 +140,7 @@
     micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
   }
 
-  // Request permissions robustly: try video+audio; if that fails, try video only
+  // Robust permissions: try AV, fall back to video-only
   async function requestPermissionsRobust() {
     perm.textContent='Permissions: requesting…';
     try{
@@ -148,15 +148,14 @@
       pre.getTracks().forEach(t=>t.stop());
       return {video:true, audio:true};
     }catch(e1){
-      // Fallback to camera-only
       try{
         const pre2 = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
         pre2.getTracks().forEach(t=>t.stop());
         hint.style.display='block';
-        hint.textContent='Microphone access failed or not available. Continuing with camera-only.';
+        hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
         return {video:true, audio:false};
       }catch(e2){
-        throw e1; // original error with audio+video usually more informative
+        throw e1;
       }
     }
   }
@@ -178,8 +177,7 @@
   function setupRecorder(){
     chunks.length=0;
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
-                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':
-                 'video/webm';
+                 MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')?'video/webm;codecs=vp8,opus':'video/webm';
     mediaRecorder = new MediaRecorder(stream,{mimeType:mime, videoBitsPerSecond:4_000_000});
     mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
     mediaRecorder.onstop = ()=>{
@@ -210,6 +208,43 @@
   mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
 
   // ---------- Eye contact (post-recording) ----------
+  // Infinity-duration fix: force Chrome to compute duration by jumping far ahead, then back.
+  async function loadVideoForAnalysis(src){
+    return new Promise((resolve, reject)=>{
+      const av = document.createElement('video');
+      av.preload = 'auto';
+      av.muted = true;
+      av.playsInline = true;
+      av.src = src;
+
+      const finish = ()=>{
+        if (!isFinite(av.duration) || av.duration <= 0) {
+          reject(new Error('Could not read video duration.'));
+        } else {
+          resolve(av);
+        }
+      };
+
+      av.addEventListener('loadedmetadata', async ()=>{
+        if (isFinite(av.duration) && av.duration > 0 && av.duration !== Infinity) {
+          finish();
+        } else {
+          // Force duration to resolve
+          const onTimeUpdate = ()=>{
+            av.removeEventListener('timeupdate', onTimeUpdate);
+            av.currentTime = 0;
+            setTimeout(finish, 0);
+          };
+          av.addEventListener('timeupdate', onTimeUpdate);
+          try { av.currentTime = 1e101; } catch(_) { /* some builds require play() */ }
+          try { av.play().then(()=>{ av.pause(); }).catch(()=>{}); } catch(_){}
+        }
+      }, {once:true});
+
+      av.addEventListener('error', ()=> reject(new Error('Video could not be loaded.')), {once:true});
+    });
+  }
+
   function facingHeuristic(face, W, H){
     const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
     const cx=(x1+x2)/2, cy=(y1+y2)/2;
@@ -232,48 +267,47 @@
   }
 
   async function analyzeEyeContact(videoURL){
+    if(!videoURL){ throw new Error('No video to analyze.'); }
+
+    // Load model once
     if(!blazeModel){
       await tf.setBackend('webgl'); // performance
-      blazeModel = await blazeface.load(); // loads from stable tfjs-models host
+      blazeModel = await blazeface.load();
     }
 
-    const av = document.createElement('video');
-    av.src = videoURL;
-    av.crossOrigin = 'anonymous';
-    av.muted = true;
-    av.playsInline = true;
-    await new Promise(res=> av.onloadedmetadata=res);
-    const duration = av.duration || 0;
-    if(!duration || !isFinite(duration)) throw new Error('Could not read video duration.');
+    // Load and fix duration
+    const av = await loadVideoForAnalysis(videoURL);
 
-    const W = pb.videoWidth || 1280, H = pb.videoHeight || 720;
+    // Use the actual video dimensions
+    const W = av.videoWidth || 1280;
+    const H = av.videoHeight || 720;
     const off = document.createElement('canvas'); off.width=W; off.height=H;
     const ox = off.getContext('2d');
 
-    const targetFPS = 4, step = 1/targetFPS;
+    const duration = av.duration;
+    const targetFPS = 4;                 // ~4 fps sampling
+    const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
     let total=0, facing=0;
 
-    for(let t=0; t<duration; t+=step){
+    for(let i=0;i<totalSteps;i++){
+      const t = Math.min(duration - 0.05, (i/targetFPS));
       await new Promise((resolve)=>{
         const onSeek = ()=>{ av.removeEventListener('seeked', onSeek); resolve(); };
         av.addEventListener('seeked', onSeek);
-        av.currentTime = Math.min(t, duration - 0.05);
+        av.currentTime = t;
       });
 
       ox.drawImage(av, 0, 0, W, H);
-
       const preds = await blazeModel.estimateFaces(off, false);
       total++;
       if(preds && preds.length===1){
         if(facingHeuristic(preds[0], W, H)) facing++;
       }
 
-      const pct = Math.round(Math.min(100, (t/duration)*100));
+      const pct = Math.round((i+1)/totalSteps*100);
       progBar.style.width = pct + '%';
       progText.textContent = pct + '%';
     }
-    progBar.style.width = '100%';
-    progText.textContent = '100%';
 
     const percent = total ? Math.round((facing/total)*100) : 0;
     scoreEl.textContent = percent + '%';
@@ -285,9 +319,9 @@
   enableBtn.addEventListener('click', async ()=>{
     clearErr();
     try{
-      const got = await requestPermissionsRobust();  // prompt on click
-      await listDevices();                           // labels appear after permission
-      await startStream(!!got.audio);                // start with/without mic
+      const got = await requestPermissionsRobust();  // prompts on click
+      await listDevices();                           // labels after permission
+      await startStream(!!got.audio);                // start stream
       perm.textContent='Permissions: granted';
       enableBtn.disabled=true;
       startBtn.disabled=false;
@@ -296,15 +330,13 @@
       perm.textContent='Permissions: denied';
       let msg = 'Unable to access camera/microphone.\n\n';
       if(e && e.name==='NotAllowedError'){
-        msg += 'Access was blocked.\nChrome: click the lock icon → Site settings → set Camera & Microphone to Allow for cambridgexr.github.io → refresh.';
+        msg += 'Access was blocked.\nChrome: lock icon → Site settings → Allow Camera & Microphone for cambridgexr.github.io → refresh.';
       } else if(e && e.name==='NotFoundError'){
         msg += 'No camera/microphone found. Connect a device and try again.';
       } else if(e && e.name==='NotReadableError'){
         msg += 'Your camera/mic is in use by another app. Close it and retry.';
       } else if(e && e.name==='OverconstrainedError'){
-        msg += 'Selected device is not available. Choose another camera/mic.';
-      } else if(e && e.name==='SecurityError'){
-        msg += 'Needs HTTPS/top-level context (GitHub Pages is OK).';
+        msg += 'Selected device not available. Choose another camera/mic.';
       } else {
         msg += (e && e.message) ? e.message : String(e);
       }
@@ -337,6 +369,7 @@
   });
 
   analyzeBtn.addEventListener('click', async ()=>{
+    clearErr();
     try{
       analyzeBtn.disabled = true;
       progBar.style.width = '0%';
