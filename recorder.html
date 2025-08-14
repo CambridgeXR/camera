@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Presentation Recorder • Eye Contact %</title>
+<style>
+  :root{--bg:#0b1120;--panel:#121a2b;--ink:#e7ecff;--muted:#a2acc4;--accent:#7aa2ff;--ok:#67f79a;--warn:#ffd166;--bad:#ff6b6b}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
+  h1{margin:0 0 12px;font-size:22px}
+  .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}
+  @media (max-width:900px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border-radius:14px;padding:12px;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+  .area{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  select,button,label.pill,a.btn{background:#0f1627;border:1px solid #26304a;color:var(--ink);padding:8px 12px;border-radius:10px;font-size:14px}
+  button{cursor:pointer}
+  button.primary{background:var(--accent);color:#0b0f1d;border:none}
+  button.danger{background:var(--bad);color:#1b0b0b;border:none}
+  button:disabled,select:disabled{opacity:.6;cursor:not-allowed}
+  .badge{font-size:12px;padding:4px 8px;border-radius:999px;background:#0f1627;border:1px solid #26304a}
+  .meter{height:8px;width:110px;border-radius:999px;background:#26304a;overflow:hidden}
+  .meter>span{display:block;height:100%;width:0%;background:#67f79a;transition:width .07s linear}
+  .result{display:flex;align-items:center;gap:10px;padding:10px;border-radius:10px;background:#0f1627;border:1px solid #26304a}
+  .score{font-size:28px;font-weight:800}
+  .tag{font-size:12px;padding:2px 8px;border-radius:8px;background:#1a2440;border:1px solid #2a3560}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#7683a8}
+  .dot.live{background:#ff5a5a;box-shadow:0 0 0 6px rgba(255,90,90,.15)}
+  .water{position:absolute;right:10px;bottom:10px;font-size:11px;padding:6px 8px;border-radius:999px;background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
+  .err{background:#2a1120;border:1px solid #ff6b6b;color:#ffd3d3;padding:8px 10px;border-radius:10px;display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎤 Presentation Recorder <span class="badge">with Eye Contact %</span></h1>
+  <div class="grid">
+    <div class="card">
+      <div class="area">
+        <video id="preview" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+        <div class="water"><span id="liveDot" class="dot"></span> Live</div>
+      </div>
+      <div class="bar">
+        <select id="camera"></select>
+        <select id="microphone"></select>
+        <label class="pill"><input type="checkbox" id="mirror"> Mirror</label>
+        <div class="pill">Mic level <span class="meter"><span id="vu"></span></span></div>
+        <span class="tag" id="faceStatus">Face detection: init…</span>
+        <span class="tag" id="perm">Permissions: not requested</span>
+      </div>
+      <div class="bar">
+        <button id="enable" class="primary">Enable camera & mic</button>
+        <button id="start" disabled>Start</button>
+        <button id="pause" disabled>Pause</button>
+        <button id="resume" disabled>Resume</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+        <a id="download" class="btn" download="practice.webm" style="display:none">Download</a>
+        <span class="tag" id="timer">00:00</span>
+      </div>
+      <div id="err" class="err"></div>
+    </div>
+    <div class="card">
+      <div class="area" style="background:#05070f">
+        <video id="playback" controls playsinline></video>
+        <div class="water">Recorded</div>
+      </div>
+      <div class="bar">
+        <div class="result" style="flex:1">
+          <div>Eye contact</div>
+          <div class="score" id="score">—%</div>
+          <div class="mini" id="scoreDetail">no recording yet</div>
+        </div>
+      </div>
+      <div class="mini">
+        Eye Contact % is computed during recording by sampling frames when a single face is centered and front-facing.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const v = document.getElementById('preview');
+  const pb = document.getElementById('playback');
+  const cv = document.getElementById('overlay');
+  const cx = cv.getContext('2d');
+  const camSel = document.getElementById('camera');
+  const micSel = document.getElementById('microphone');
+  const mirror = document.getElementById('mirror');
+  const faceStatus = document.getElementById('faceStatus');
+  const perm = document.getElementById('perm');
+  const enableBtn = document.getElementById('enable');
+  const startBtn = document.getElementById('start');
+  const pauseBtn = document.getElementById('pause');
+  const resumeBtn = document.getElementById('resume');
+  const stopBtn = document.getElementById('stop');
+  const downloadLink = document.getElementById('download');
+  const timerEl = document.getElementById('timer');
+  const scoreEl = document.getElementById('score');
+  const scoreDetail = document.getElementById('scoreDetail');
+  const vu = document.getElementById('vu');
+  const liveDot = document.getElementById('liveDot');
+  const errBox = document.getElementById('err');
+
+  let stream=null, mediaRecorder=null, chunks=[];
+  let audioAnalyser, audioData, audioSrc;
+  let faceDetector=null;
+  let recording=false, paused=false;
+  let samples=0, facingSamples=0, sampleFPS=10, lastSampleTs=0;
+
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
+
+  function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return \`\${m}:\${x}\`; }
+  let tIv=null, tStart=0;
+  function startTimer(){ tStart=Date.now(); timerEl.textContent='00:00'; if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-tStart)/1000) },200); }
+  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
+
+  function setCanvasSize(){
+    const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight;
+    if(w&&h){ cv.width=w; cv.height=h; }
+  }
+  function setFaceStatus(txt){ faceStatus.textContent = 'Face detection: ' + txt; }
+
+  async function listDevices(){
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    camSel.innerHTML = devs.filter(d=>d.kind==='videoinput').map(d=>\`<option value="\${d.deviceId}">\${d.label||'Camera'}</option>\`).join('');
+    micSel.innerHTML = devs.filter(d=>d.kind==='audioinput').map(d=>\`<option value="\${d.deviceId}">\${d.label||'Microphone'}</option>\`).join('');
+  }
+
+  async function startStream(){
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: camSel.value? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+      audio: { deviceId: micSel.value? {exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true }
+    });
+    v.srcObject = stream; await v.play();
+    liveDot.classList.add('live');
+    setCanvasSize();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = new AC();
+    audioSrc = ac.createMediaStreamSource(stream);
+    audioAnalyser = ac.createAnalyser();
+    audioAnalyser.fftSize = 256;
+    audioData = new Uint8Array(audioAnalyser.frequencyBinCount);
+    audioSrc.connect(audioAnalyser);
+  }
+
+  function setupRecorder(){
+    chunks.length=0;
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':'video/webm';
+    mediaRecorder = new MediaRecorder(stream,{mimeType:mime});
+    mediaRecorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+    mediaRecorder.onstop = ()=>{
+      const blob = new Blob(chunks,{type: mediaRecorder.mimeType});
+      const url = URL.createObjectURL(blob);
+      pb.src = url;
+      downloadLink.href = url;
+      downloadLink.style.display='inline-flex';
+      const pct = samples? Math.round((facingSamples/samples)*100): 0;
+      scoreEl.textContent = pct + '%';
+      scoreEl.style.color = pct>=70? 'var(--ok)' : pct>=40? 'var(--warn)' : 'var(--bad)';
+      scoreDetail.textContent = \`\${facingSamples} of \${samples} frames\`;
+    };
+  }
+
+  function initFaceDetector(){
+    if('FaceDetector' in window){
+      try{
+        faceDetector = new window.FaceDetector({fastMode:true, maxDetectedFaces:2});
+        setFaceStatus('on');
+      }catch(e){ setFaceStatus('off'); }
+    }else{ setFaceStatus('not supported'); }
+  }
+
+  function isFacingCamera(face, w, h){
+    const bb = face.boundingBox;
+    const cx = bb.x + bb.width/2, cy = bb.y + bb.height/2;
+    const centerOk = (cx > w*0.3 && cx < w*0.7 && cy > h*0.28 && cy < h*0.72);
+    const sizeOk = (bb.width*bb.height)/(w*h) > 0.03;
+    const aspectOk = (bb.width / bb.height) > 0.75 && (bb.width / bb.height) < 1.45;
+    return centerOk && sizeOk && aspectOk;
+  }
+
+  function drawDetections(faces){
+    cx.clearRect(0,0,cv.width,cv.height);
+    if(!faces) return;
+    cx.save();
+    if(mirror.checked){ cx.translate(cv.width,0); cx.scale(-1,1); }
+    cx.lineWidth=2; cx.strokeStyle='rgba(122,162,255,0.95)';
+    faces.forEach((f)=>{ const b=f.boundingBox; cx.strokeRect(b.x,b.y,b.width,b.height); });
+    cx.restore();
+  }
+
+  function loop(){
+    requestAnimationFrame(loop);
+    if(!stream) return;
+    setCanvasSize();
+    if(audioAnalyser){
+      audioAnalyser.getByteTimeDomainData(audioData);
+      let peak=0; for(let i=0;i<audioData.length;i++){ peak = Math.max(peak, Math.abs(audioData[i]-128)); }
+      vu.style.width = Math.min(100, Math.round(peak/128*100)) + '%';
+    }
+    if(faceDetector && v.readyState>=2){
+      faceDetector.detect(v).then(faces=>{
+        drawDetections(faces);
+        setFaceStatus(faces.length? \`on (\${faces.length})\` : 'on (0)');
+        const now = performance.now();
+        if(recording && !paused && (now - lastSampleTs) > (1000/sampleFPS)){
+          lastSampleTs = now;
+          samples++;
+          if(faces.length===1 && isFacingCamera(faces[0], cv.width, cv.height)) facingSamples++;
+        }
+      }).catch(()=>{});
+    }
+  }
+
+  mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
+
+  enableBtn.addEventListener('click', async ()=>{
+    clearErr();
+    try{
+      await startStream();
+      await listDevices();
+      initFaceDetector();
+      perm.textContent='Permissions: granted';
+      enableBtn.disabled=true;
+      startBtn.disabled=false;
+      loop();
+    }catch(e){
+      showErr('Camera/Microphone access failed: ' + (e.message||e));
+      perm.textContent='Permissions: denied';
+    }
+  });
+
+  camSel.addEventListener('change', startStream);
+  micSel.addEventListener('change', startStream);
+
+  startBtn.addEventListener('click', ()=>{
+    if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
+    setupRecorder(); samples=0; facingSamples=0;
+    mediaRecorder.start(); recording=true; paused=false;
+    startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
+    startTimer();
+  });
+
+  pauseBtn.addEventListener('click', ()=>{ mediaRecorder.pause(); paused=true; pauseBtn.disabled=true; resumeBtn.disabled=false; });
+  resumeBtn.addEventListener('click', ()=>{ mediaRecorder.resume(); paused=false; pauseBtn.disabled=false; resumeBtn.disabled=true; });
+
+  stopBtn.addEventListener('click', ()=>{
+    mediaRecorder.stop(); recording=false; paused=false;
+    stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false;
+    stopTimer();
+  });
+})();
+</script>
+</body>
+</html>
