@@ -31,9 +31,12 @@
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
-<!-- Stable TFJS + BlazeFace -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
+
+<!-- TensorFlow.js + Face Landmarks Detection (with iris) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.14.0/dist/tf-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.14.0/dist/tf-converter.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.14.0/dist/tf-backend-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@1.0.3/dist/face-landmarks-detection.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -120,8 +123,10 @@
   // ---------- State ----------
   let stream=null, mediaRecorder=null, chunks=[];
   let recording=false, paused=false;
-  let blazeModel=null;
   let tIv=null, tStart=0;
+
+  // FaceMesh model
+  let flModel=null;
 
   // ---------- Utils ----------
   function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
@@ -201,14 +206,81 @@
     cx.save();
     if(mirror.checked){ cx.translate(W,0); cx.scale(-1,1); }
     cx.strokeStyle='rgba(122,162,255,0.5)'; cx.lineWidth=2;
-    const gx=W*0.28, gy=H*0.25, gw=W*0.44, gh=H*0.5;
+    const gx=W*0.28, gy=H*0.25, gw=W*0.44, gh=H*0.5; // acceptable center window
     cx.strokeRect(gx,gy,gw,gh);
     cx.restore();
   }
   mirror.addEventListener('change', ()=>{ v.style.transform = mirror.checked? 'scaleX(-1)':'none'; });
 
-  // ---------- Eye contact (post-recording) ----------
-  // Infinity-duration fix: force Chrome to compute duration by jumping far ahead, then back.
+  // ---------- FaceMesh load (once, lazy) ----------
+  async function ensureFaceModel(){
+    if(flModel) return;
+    await tf.setBackend('webgl');
+    flModel = await faceLandmarksDetection.load(
+      faceLandmarksDetection.SupportedPackages.mediapipeFacemesh,
+      { maxFaces: 1, shouldLoadIrisModel: true }
+    );
+  }
+
+  // ---------- Helpers for gaze & pose ----------
+  function bboxFromPoints(points){
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    for(const p of points){ const x=p[0], y=p[1]; if(x<minX)minX=x; if(y<minY)minY=y; if(x>maxX)maxX=x; if(y>maxY)maxY=y; }
+    return {x:minX,y:minY,w:maxX-minX,h:maxY-minY,cx:(minX+maxX)/2,cy:(minY+maxY)/2};
+  }
+  function avgPoint(arr){ let x=0,y=0,n=arr.length||1; for(const p of arr){ x+=p[0]; y+=p[1]; } return [x/n,y/n]; }
+
+  // Eye contact rule: centered+big + head yaw/pitch modest + both irises near eye centers
+  function eyeContactFromAnnotations(ann, frameW, frameH){
+    if(!ann?.leftEyeIris || !ann?.rightEyeIris) return false;
+
+    const leftIrisC = avgPoint(ann.leftEyeIris);
+    const rightIrisC = avgPoint(ann.rightEyeIris);
+
+    const leftEyePts = []
+      .concat(ann.leftEyeUpper0||[], ann.leftEyeLower0||[], ann.leftEyeInnerCorner||[], ann.leftEyeOuterCorner||[]);
+    const rightEyePts = []
+      .concat(ann.rightEyeUpper0||[], ann.rightEyeLower0||[], ann.rightEyeInnerCorner||[], ann.rightEyeOuterCorner||[]);
+
+    const lb = bboxFromPoints(leftEyePts), rb = bboxFromPoints(rightEyePts);
+    const lCenter = [lb.cx, lb.cy], rCenter = [rb.cx, rb.cy];
+
+    // Normalized iris offset per eye (0 = center, 1 = at eyelid edge)
+    const ldx = Math.abs(leftIrisC[0]-lCenter[0]) / (lb.w/2 || 1);
+    const ldy = Math.abs(leftIrisC[1]-lCenter[1]) / (lb.h/2 || 1);
+    const rdx = Math.abs(rightIrisC[0]-rCenter[0]) / (rb.w/2 || 1);
+    const rdy = Math.abs(rightIrisC[1]-rCenter[1]) / (rb.h/2 || 1);
+
+    const irisCentered = (ldx<0.35 && ldy<0.35 && rdx<0.35 && rdy<0.35); // stricter gaze threshold
+
+    // Head pose & framing (use coarse bbox of full mesh)
+    const facePts = []
+      .concat(ann.silhouette||[], ann.leftCheek||[], ann.rightCheek||[], ann.midwayBetweenEyes||[], ann.noseTip||[]);
+    if(facePts.length===0) return false;
+    const fb = bboxFromPoints(facePts);
+
+    const centerOk = (fb.cx > frameW*0.28 && fb.cx < frameW*0.72 && fb.cy > frameH*0.25 && fb.cy < frameH*0.75);
+    const sizeOk   = (fb.w*fb.h)/(frameW*frameH) > 0.035;
+
+    // Yaw/pitch heuristics from eye lines & nose relative to eye-line
+    const Lc = avgPoint(ann.leftEyeUpper0||[]);
+    const Rc = avgPoint(ann.rightEyeUpper0||[]);
+    const eyeDx = Math.hypot((Rc[0]-Lc[0]), (Rc[1]-Lc[1])) || 1;
+    const eyesLevel = Math.abs((Rc[1]-Lc[1]))/eyeDx < 0.18; // pitch/roll proxy
+
+    const nose = (ann.noseTip && ann.noseTip[0]) ? ann.noseTip[0] : avgPoint(ann.noseBottom||ann.noseBridge||[[fb.cx,fb.cy]]);
+    const earL = (ann.leftEarTragion && ann.leftEarTragion[0]) ? ann.leftEarTragion[0] : [fb.x, fb.cy];
+    const earR = (ann.rightEarTragion && ann.rightEarTragion[0]) ? ann.rightEarTragion[0] : [fb.x+fb.w, fb.cy];
+    const dNL = Math.hypot(nose[0]-earL[0], nose[1]-earL[1]);
+    const dNR = Math.hypot(nose[0]-earR[0], nose[1]-earR[1]);
+    const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
+    const yawOk = yawSkew < 0.30;
+
+    return centerOk && sizeOk && eyesLevel && yawOk && irisCentered;
+  }
+
+  // ---------- Analyzer (post-recording) ----------
+  // Fix Chrome "Infinity" duration by nudging time
   async function loadVideoForAnalysis(src){
     return new Promise((resolve, reject)=>{
       const av = document.createElement('video');
@@ -217,75 +289,44 @@
       av.playsInline = true;
       av.src = src;
 
-      const finish = ()=>{
+      function finish(){
         if (!isFinite(av.duration) || av.duration <= 0) {
           reject(new Error('Could not read video duration.'));
         } else {
           resolve(av);
         }
-      };
+      }
 
-      av.addEventListener('loadedmetadata', async ()=>{
+      av.addEventListener('loadedmetadata', ()=>{
         if (isFinite(av.duration) && av.duration > 0 && av.duration !== Infinity) {
           finish();
         } else {
-          // Force duration to resolve
           const onTimeUpdate = ()=>{
             av.removeEventListener('timeupdate', onTimeUpdate);
             av.currentTime = 0;
             setTimeout(finish, 0);
           };
           av.addEventListener('timeupdate', onTimeUpdate);
-          try { av.currentTime = 1e101; } catch(_) { /* some builds require play() */ }
+          try { av.currentTime = 1e101; } catch(_){}
           try { av.play().then(()=>{ av.pause(); }).catch(()=>{}); } catch(_){}
         }
       }, {once:true});
-
       av.addEventListener('error', ()=> reject(new Error('Video could not be loaded.')), {once:true});
     });
   }
 
-  function facingHeuristic(face, W, H){
-    const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
-    const cx=(x1+x2)/2, cy=(y1+y2)/2;
-    const areaRatio=((x2-x1)*(y2-y1))/(W*H);
-    const centerOk = (cx > W*0.28 && cx < W*0.72 && cy > H*0.25 && cy < H*0.75);
-    const sizeOk   = areaRatio > 0.035;
-
-    const Reye=face.landmarks[0], Leye=face.landmarks[1], Nose=face.landmarks[2], Rear=face.landmarks[4], Lear=face.landmarks[5];
-    const eyeDist = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
-    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDist < 0.18;
-    const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
-    const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
-    const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
-    const yawOk = yawSkew < 0.30;
-    const eyeMidY = (Leye[1]+Reye[1])/2;
-    const pitch = Math.abs(Nose[1]-eyeMidY) / ((y2-y1) || 1);
-    const pitchOk = pitch < 0.35;
-
-    return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
-  }
-
   async function analyzeEyeContact(videoURL){
     if(!videoURL){ throw new Error('No video to analyze.'); }
+    await ensureFaceModel();
 
-    // Load model once
-    if(!blazeModel){
-      await tf.setBackend('webgl'); // performance
-      blazeModel = await blazeface.load();
-    }
-
-    // Load and fix duration
     const av = await loadVideoForAnalysis(videoURL);
-
-    // Use the actual video dimensions
     const W = av.videoWidth || 1280;
     const H = av.videoHeight || 720;
     const off = document.createElement('canvas'); off.width=W; off.height=H;
     const ox = off.getContext('2d');
 
     const duration = av.duration;
-    const targetFPS = 4;                 // ~4 fps sampling
+    const targetFPS = 6;                // denser sampling than before
     const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
     let total=0, facing=0;
 
@@ -298,10 +339,13 @@
       });
 
       ox.drawImage(av, 0, 0, W, H);
-      const preds = await blazeModel.estimateFaces(off, false);
+
+      // Estimate landmarks with iris
+      const preds = await flModel.estimateFaces({input: off, flipHorizontal: false, returnTensors: false, predictIrises: true});
       total++;
-      if(preds && preds.length===1){
-        if(facingHeuristic(preds[0], W, H)) facing++;
+
+      if (Array.isArray(preds) && preds.length === 1 && preds[0].annotations) {
+        if (eyeContactFromAnnotations(preds[0].annotations, W, H)) facing++;
       }
 
       const pct = Math.round((i+1)/totalSteps*100);
@@ -320,8 +364,8 @@
     clearErr();
     try{
       const got = await requestPermissionsRobust();  // prompts on click
-      await listDevices();                           // labels after permission
-      await startStream(!!got.audio);                // start stream
+      await listDevices();
+      await startStream(!!got.audio);
       perm.textContent='Permissions: granted';
       enableBtn.disabled=true;
       startBtn.disabled=false;
@@ -351,11 +395,14 @@
 
   startBtn.addEventListener('click', ()=>{
     if(!stream){ showErr('Click “Enable camera & mic” first.'); return; }
+    chunks.length=0;
     setupRecorder();
     mediaRecorder.start();
     recording=true; paused=false;
     startBtn.disabled=true; stopBtn.disabled=false; pauseBtn.disabled=false; resumeBtn.disabled=true;
-    startTimer();
+    // simple timer
+    const t0 = Date.now(); timerEl.textContent='00:00';
+    tIv = setInterval(()=>{ const s=(Date.now()-t0)/1000; const m=Math.floor(s/60).toString().padStart(2,'0'); const ss=Math.floor(s%60).toString().padStart(2,'0'); timerEl.textContent=`${m}:${ss}`; }, 250);
   });
 
   pauseBtn.addEventListener('click', ()=>{ if(mediaRecorder && mediaRecorder.state==='recording'){ mediaRecorder.pause(); paused=true; pauseBtn.disabled=true; resumeBtn.disabled=false; }});
@@ -364,7 +411,7 @@
     if(mediaRecorder && (mediaRecorder.state==='recording' || mediaRecorder.state==='paused')){
       mediaRecorder.stop(); recording=false; paused=false;
       stopBtn.disabled=true; pauseBtn.disabled=true; resumeBtn.disabled=true; startBtn.disabled=false;
-      stopTimer();
+      if(tIv) clearInterval(tIv);
     }
   });
 
