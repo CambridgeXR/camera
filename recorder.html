@@ -31,10 +31,6 @@
   .progress{height:8px;background:#26304a;border-radius:999px;overflow:hidden;flex:1}
   .progress>span{display:block;height:100%;width:0%;background:#7aa2ff;transition:width .1s linear}
 </style>
-
-<!-- Stable UMD builds (no ES modules) -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -92,7 +88,7 @@
 
 <script>
 (() => {
-  // ---------- Elements ----------
+  // =================== DOM ===================
   const v = document.getElementById('preview');
   const pb = document.getElementById('playback');
   const cv = document.getElementById('overlay');
@@ -116,20 +112,19 @@
   const scoreEl = document.getElementById('score');
   const scoreDetail = document.getElementById('scoreDetail');
 
-  // ---------- State ----------
+  // =================== State ===================
   let stream=null, mediaRecorder=null, chunks=[];
-  let tIv=null;
-  let blazeModel=null;
+  let timerIv=null;
 
-  // ---------- Utils ----------
-  function showErr(msg){ errBox.textContent = msg; errBox.style.display = 'block'; }
+  // =================== Utils ===================
+  function showErr(msg){ errBox.textContent = msg; errBox.style.display='block'; }
   function clearErr(){ errBox.style.display='none'; errBox.textContent=''; }
   function fmt(s){ const m=Math.floor(s/60).toString().padStart(2,'0'); const x=Math.floor(s%60).toString().padStart(2,'0'); return `${m}:${x}`; }
-  function startTimer(){ const t0=Date.now(); if(tIv) clearInterval(tIv); tIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-t0)/1000); },250); }
-  function stopTimer(){ if(tIv) clearInterval(tIv); tIv=null; }
+  function startTimer(){ const t0=Date.now(); if(timerIv) clearInterval(timerIv); timerIv=setInterval(()=>{ timerEl.textContent=fmt((Date.now()-t0)/1000); },250); }
+  function stopTimer(){ if(timerIv) clearInterval(timerIv); timerIv=null; }
   function setCanvasSize(){ const w=v.videoWidth||cv.clientWidth, h=v.videoHeight||cv.clientHeight; if(w&&h){ cv.width=w; cv.height=h; } }
 
-  // ---------- Devices & stream ----------
+  // =================== Device & Stream ===================
   async function listDevices(){
     const devs = await navigator.mediaDevices.enumerateDevices();
     const cams = devs.filter(d=>d.kind==='videoinput');
@@ -138,38 +133,37 @@
     micSel.innerHTML = mics.map(d=>`<option value="${d.deviceId}">${d.label||'Microphone'}</option>`).join('') || '<option>No mic</option>';
   }
 
-  async function requestPermissionsRobust(){
+  async function requestPermissions(){
     perm.textContent='Permissions: requesting…';
     try{
-      const pre = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+      const pre = await navigator.mediaDevices.getUserMedia({ video:true, audio:true });
       pre.getTracks().forEach(t=>t.stop());
-      return {video:true,audio:true};
+      return {video:true, audio:true};
     }catch(e1){
+      // Fallback to camera-only
       try{
-        const pre2 = await navigator.mediaDevices.getUserMedia({video:true,audio:false});
+        const pre2 = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
         pre2.getTracks().forEach(t=>t.stop());
         hint.style.display='block';
         hint.textContent='Microphone access failed or is blocked. Continuing with camera-only.';
-        return {video:true,audio:false};
-      }catch(e2){
-        throw e1;
-      }
+        return {video:true, audio:false};
+      }catch(e2){ throw e1; }
     }
   }
 
   async function startStream(wantAudio=true){
     if(stream) stream.getTracks().forEach(t=>t.stop());
     stream = await navigator.mediaDevices.getUserMedia({
-      video:{ deviceId: camSel.value?{exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
+      video: { deviceId: camSel.value ? {exact:camSel.value}:undefined, width:{ideal:1280}, height:{ideal:720} },
       audio: wantAudio ? { deviceId: micSel.value?{exact:micSel.value}:undefined, echoCancellation:true, noiseSuppression:true, autoGainControl:true } : false
     });
-    v.srcObject=stream; v.muted=true; await v.play();
+    v.srcObject = stream; v.muted = true; await v.play();
     liveDot.classList.add('live');
     setCanvasSize();
     drawGuide();
   }
 
-  // ---------- Recorder ----------
+  // =================== Recorder ===================
   function setupRecorder(){
     chunks.length=0;
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')?'video/webm;codecs=vp9,opus':
@@ -187,7 +181,7 @@
     };
   }
 
-  // ---------- Overlay guide ----------
+  // =================== Overlay guide (no mirroring) ===================
   function drawGuide(){
     requestAnimationFrame(drawGuide);
     if(!v || v.readyState<2) return;
@@ -200,49 +194,55 @@
     cx.strokeRect(gx,gy,gw,gh);
   }
 
-  // ---------- Load face model (once) ----------
-  async function ensureBlaze(){
-    if(blazeModel) return;
-    await tf.setBackend('webgl'); await tf.ready();
-    blazeModel = await blazeface.load(); // loads from tfjs-models store
+  // =================== Safe dynamic script loader (for analysis only) ===================
+  function loadScript(src){
+    return new Promise((resolve,reject)=>{
+      const s=document.createElement('script');
+      s.src=src; s.async=true; s.onload=resolve; s.onerror=()=>reject(new Error('Failed to load '+src));
+      document.head.appendChild(s);
+    });
   }
 
-  // ---------- Facing-forward heuristic (pose-only, lenient) ----------
-  function forwardFacingBlaze(face, W, H){
+  async function ensureFaceModel(){
+    if(window.blazeface && window.tf && window.__blazeModel) return window.__blazeModel;
+    if(!window.tf) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js');
+    if(!window.blazeface) await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js');
+    try{ await tf.setBackend('webgl'); }catch(_){} // best-effort
+    window.__blazeModel = await blazeface.load();
+    return window.__blazeModel;
+  }
+
+  // =================== Facing-forward heuristic (pose-only, lenient) ===================
+  function forwardFacing(face, W, H){
     const [x1,y1]=face.topLeft, [x2,y2]=face.bottomRight;
     const cx=(x1+x2)/2, cy=(y1+y2)/2;
     const w=(x2-x1), h=(y2-y1);
     const areaRatio=(w*h)/(W*H);
 
-    // framing (wide box so "clearly visible" reads as forward)
-    const centerOk = (cx > W*0.20 && cx < W*0.80 && cy > H*0.18 && cy < H*0.82);
-    const sizeOk   = areaRatio > 0.020;
+    const centerOk = (cx > W*0.18 && cx < W*0.82 && cy > H*0.16 && cy < H*0.84);
+    const sizeOk   = areaRatio > 0.018;
 
-    // landmarks: [rightEye, leftEye, nose, mouth, rightEar, leftEar]
     const lm = face.landmarks || [];
-    if(lm.length < 6) return centerOk && sizeOk; // fall back to framing only
+    if(lm.length < 6) return centerOk && sizeOk;
 
     const Reye=lm[0], Leye=lm[1], Nose=lm[2], Rear=lm[4], Lear=lm[5];
 
-    // Eyes roughly level (roll/pitch proxy)
     const eyeDx = Math.hypot(Leye[0]-Reye[0], Leye[1]-Reye[1]) || 1;
-    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDx < 0.22;  // lenient
+    const eyesLevel = Math.abs(Leye[1]-Reye[1]) / eyeDx < 0.25;  // lenient
 
-    // Yaw: nose distance to ears similar
     const dNL = Math.hypot(Nose[0]-Lear[0], Nose[1]-Lear[1]);
     const dNR = Math.hypot(Nose[0]-Rear[0], Nose[1]-Rear[1]);
     const yawSkew = Math.abs(dNL - dNR) / ((dNL + dNR)/2 || 1);
-    const yawOk = yawSkew < 0.40; // lenient
+    const yawOk = yawSkew < 0.45; // lenient
 
-    // Pitch: nose near eye-line (relative to face height)
     const eyeMidY = (Leye[1]+Reye[1])/2;
     const pitch = Math.abs(Nose[1]-eyeMidY) / (h || 1);
-    const pitchOk = pitch < 0.40; // lenient
+    const pitchOk = pitch < 0.45; // lenient
 
     return centerOk && sizeOk && eyesLevel && yawOk && pitchOk;
   }
 
-  // ---------- Duration fix ----------
+  // =================== Duration fix for WebM blobs ===================
   function loadVideoForAnalysis(src){
     return new Promise((resolve, reject)=>{
       const av=document.createElement('video');
@@ -264,47 +264,47 @@
     });
   }
 
-  // ---------- Analyzer (post-recording) ----------
-  async function analyzeEyeContact(videoURL){
+  // =================== Analyzer (post-recording) ===================
+  async function analyze(videoURL){
     if(!videoURL) throw new Error('No video to analyze.');
-    await ensureBlaze();
-
+    const model = await ensureFaceModel();
     const av = await loadVideoForAnalysis(videoURL);
+
     const W = av.videoWidth || 1280, H = av.videoHeight || 720;
     const off = document.createElement('canvas'); off.width=W; off.height=H;
     const ox = off.getContext('2d');
 
     const duration = av.duration;
-    const targetFPS = 6; // dense sampling
-    const totalSteps = Math.max(1, Math.floor(duration * targetFPS));
+    const fps = 6;
+    const steps = Math.max(1, Math.floor(duration * fps));
     let total=0, facing=0;
 
-    for(let i=0;i<totalSteps;i++){
-      const t = Math.min(duration - 0.05, (i/targetFPS));
+    for(let i=0;i<steps;i++){
+      const t = Math.min(duration - 0.05, i/fps);
       await new Promise((resolve)=>{ const onSeek=()=>{ av.removeEventListener('seeked',onSeek); resolve(); }; av.addEventListener('seeked',onSeek); av.currentTime=t; });
-
       ox.drawImage(av, 0, 0, W, H);
-      const preds = await blazeModel.estimateFaces(off, false);
+
+      const preds = await model.estimateFaces(off, false);
       total++;
       if(preds && preds.length===1){
-        if(forwardFacingBlaze(preds[0], W, H)) facing++;
+        if(forwardFacing(preds[0], W, H)) facing++;
       }
 
-      const pct = Math.round((i+1)/totalSteps*100);
+      const pct = Math.round((i+1)/steps*100);
       progBar.style.width = pct + '%'; progText.textContent = pct + '%';
     }
 
     const percent = total ? Math.round((facing/total)*100) : 0;
     scoreEl.textContent = percent + '%';
     scoreEl.style.color = percent>=70? 'var(--ok)' : percent>=40? 'var(--warn)' : 'var(--bad)';
-    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${targetFPS} fps)`;
+    scoreDetail.textContent = `${facing} of ${total} sampled frames (~${fps} fps)`;
   }
 
-  // ---------- Handlers ----------
+  // =================== Handlers ===================
   enableBtn.addEventListener('click', async ()=>{
     clearErr();
     try{
-      const got = await requestPermissionsRobust();
+      const got = await requestPermissions();
       await listDevices();
       await startStream(!!got.audio);
       perm.textContent='Permissions: granted';
@@ -318,7 +318,8 @@
       else if(e?.name==='NotReadableError'){ msg+='Your camera/mic is in use by another app. Close it and retry.'; }
       else if(e?.name==='OverconstrainedError'){ msg+='Selected device not available. Choose another camera/mic.'; }
       else { msg+= (e?.message) ? e.message : String(e); }
-      showErr(msg); hint.style.display='block';
+      showErr(msg);
+      hint.style.display='block';
       hint.textContent='Windows tip: Settings → Privacy & security → Camera/Microphone → allow access for browsers.';
     }
   });
@@ -345,12 +346,12 @@
     clearErr();
     try{
       analyzeBtn.disabled=true; progBar.style.width='0%'; progText.textContent='0%'; scoreEl.textContent='—%'; scoreDetail.textContent='analyzing…';
-      await analyzeEyeContact(pb.src);
+      await analyze(pb.src);
     }catch(e){ console.error(e); showErr('Analysis failed: ' + (e?.message || e)); }
     finally{ analyzeBtn.disabled=false; }
   });
 
-  // Early checks
+  // Early support checks
   (function(){
     if(!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)){
       perm.textContent='Unsupported browser';
@@ -360,6 +361,9 @@
       showErr('Recording is not supported in this browser.');
     }
   })();
+
+  // Global error surfacing so a script error never silently kills the Enable button
+  window.addEventListener('error', e => { showErr('Runtime error: '+ (e.message||e.error||'unknown')); });
 })();
 </script>
 </body>
